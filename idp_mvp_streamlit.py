@@ -10,6 +10,12 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+
 try:
     import pytesseract
 except Exception:
@@ -653,6 +659,73 @@ def debug_show_all_blocks(raw_blocks: List[OCRBlock], merged_blocks: List[OCRBlo
             st.dataframe(pd.DataFrame(hits, columns=["bloc", "format_score"]), use_container_width=True)
 
 
+
+# =========================
+# ngeneriw PDF report
+# =========================
+def generate_extraction_pdf(extraction: dict) -> bytes:
+    """
+    Generate a clean PDF report with extracted invoice information.
+    Confidence scores are intentionally hidden from the exported report.
+    """
+    buffer = io.BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+    )
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    title = Paragraph("IDP Invoice OCR - Extraction Report", styles["Title"])
+    story.append(title)
+    story.append(Spacer(1, 0.5 * cm))
+
+
+
+    ref = extraction.get("invoice_reference", {})
+    fin = extraction.get("financial", {})
+
+    data = [
+        ["Field", "Extracted value"],
+        ["Protocol number", ref.get("protocol_number", {}).get("value") or "Not detected"],
+        ["Invoice number", ref.get("invoice_number", {}).get("value") or "Not detected"],
+        ["Invoice date", ref.get("invoice_date", {}).get("value") or "Not detected"],
+        ["Net amount", fin.get("net_amount", {}).get("value") or "Not detected"],
+    ]
+
+    table = Table(data, colWidths=[6 * cm, 9 * cm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
+            ]
+        )
+    )
+
+    story.append(table)
+
+    doc.build(story)
+
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    return pdf_bytes
+
 # =========================
 # lihne aana Streamlit app
 # =========================
@@ -731,6 +804,21 @@ with tab3:
     st.write(f"Score bloc références : **{ref['block_confidence']}**")
     st.write(f"Score bloc financier  : **{fin['block_confidence']}**")
     st.write(f"Score global          : **{extraction['global_confidence']}**")
+
+    # =========================
+    # lihne zidit PDF export button
+    # =========================
+    st.markdown("---")
+    st.subheader("Export PDF")
+
+    pdf_report = generate_extraction_pdf(extraction)
+
+    st.download_button(
+        label="Download extraction PDF report",
+        data=pdf_report,
+        file_name="invoice_extraction_report.pdf",
+        mime="application/pdf",
+    )
 
     if extraction["global_confidence"] < 0.5:
         st.warning(
