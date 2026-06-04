@@ -5,3 +5,4 @@ pandas
 pillow
 pytesseract
 pdf2image
+reportlab
