@@ -6,3 +6,4 @@ pillow
 pytesseract
 pdf2image
 reportlab
+pymupdf
