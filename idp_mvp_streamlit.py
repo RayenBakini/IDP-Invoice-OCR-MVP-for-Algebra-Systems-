@@ -2,7 +2,7 @@ import io
 import os
 import re
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -10,11 +10,22 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw
 
-from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import cm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
 try:
     import pytesseract
@@ -25,6 +36,7 @@ try:
     from pdf2image import convert_from_bytes
 except Exception:
     convert_from_bytes = None
+
 
 # =========================
 # Configuration Windows
@@ -37,7 +49,19 @@ if pytesseract is not None:
 
 
 # =========================
-# Data models
+# Formats métier
+# =========================
+AMOUNT_PATTERN = (
+    r"[-+]?\d{1,3}(?:\.\d{3})*,\d{2}"
+    r"|[-+]?\d+,\d{2}"
+)
+
+DATE_PATTERN = r"\d{1,2}/\d{1,2}/\d{2,4}"
+PERCENT_PATTERN = r"\d{1,2}(?:[.,]\d{1,2})?"
+
+
+# =========================
+# Data model OCR
 # =========================
 @dataclass
 class OCRBlock:
@@ -50,7 +74,182 @@ class OCRBlock:
 
 
 # =========================
-# preprocessing
+# Outils généraux
+# =========================
+def normalize_text(text: str) -> str:
+    """
+    Normalise les accents, espaces et caractères spéciaux
+    pour faciliter les comparaisons.
+    """
+    value = text or ""
+
+    replacements = [
+        ("á", "a"),
+        ("é", "e"),
+        ("í", "i"),
+        ("ó", "o"),
+        ("ú", "u"),
+        ("ü", "u"),
+        ("ñ", "n"),
+        ("Á", "A"),
+        ("É", "E"),
+        ("Í", "I"),
+        ("Ó", "O"),
+        ("Ú", "U"),
+        ("Ü", "U"),
+        ("Ñ", "N"),
+        ("º", "o"),
+        ("°", "o"),
+        ("ª", "a"),
+    ]
+
+    for source, target in replacements:
+        value = value.replace(source, target)
+
+    value = re.sub(
+        r"[\u2010\u2011\u2012\u2013\u2014\u2015\ufe58\ufe63\uff0d]",
+        "-",
+        value,
+    )
+
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def clean_lines(text: str) -> List[str]:
+    """
+    Nettoie les lignes sans détruire leur ordre.
+    """
+    return [
+        re.sub(r"\s+", " ", line).strip()
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+
+
+def clean_amount(value: Optional[str]) -> Optional[str]:
+    """
+    Retire les symboles monétaires et les espaces.
+    """
+    if value is None:
+        return None
+
+    return re.sub(
+        r"[€$£\s\u00a0]",
+        "",
+        value,
+    ).strip()
+
+
+def amount_to_float(value: Optional[str]) -> Optional[float]:
+    """
+    Convertit un montant européen en float.
+
+    Exemple :
+    1.004,67 -> 1004.67
+    """
+    cleaned = clean_amount(value)
+
+    if not cleaned:
+        return None
+
+    normalized = cleaned.replace(".", "").replace(",", ".")
+
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def format_european_amount(value: Optional[float]) -> Optional[str]:
+    """
+    Convertit un float en montant européen.
+
+    Exemple :
+    1004.67 -> 1.004,67
+    """
+    if value is None:
+        return None
+
+    formatted = f"{value:,.2f}"
+
+    return (
+        formatted
+        .replace(",", "#")
+        .replace(".", ",")
+        .replace("#", ".")
+    )
+
+
+def normalize_percentage(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    return (
+        value
+        .replace(".", ",")
+        .replace("%", "")
+        .strip()
+    )
+
+
+def first_regex(
+    pattern: str,
+    text: str,
+    flags: int = re.IGNORECASE | re.DOTALL,
+    group: int = 1,
+) -> Optional[str]:
+    """
+    Retourne le premier résultat correspondant au pattern.
+    """
+    match = re.search(pattern, text, flags)
+
+    if not match:
+        return None
+
+    return match.group(group).strip()
+
+
+def last_regex(
+    pattern: str,
+    text: str,
+    flags: int = re.IGNORECASE | re.DOTALL,
+    group: int = 1,
+) -> Optional[str]:
+    """
+    Retourne le dernier résultat correspondant au pattern.
+    """
+    matches = list(re.finditer(pattern, text, flags))
+
+    if not matches:
+        return None
+
+    return matches[-1].group(group).strip()
+
+
+def field(
+    value: Optional[str],
+    confidence: float,
+    source: str,
+) -> Dict[str, object]:
+    """
+    Crée la structure JSON d'un champ extrait.
+    """
+    return {
+        "value": value,
+        "confidence": round(
+            confidence if value is not None else 0.0,
+            3,
+        ),
+        "source": (
+            source
+            if value is not None
+            else "not_detected"
+        ),
+    }
+
+
+# =========================
+# Images et prétraitement
 # =========================
 def pil_to_cv2(image: Image.Image) -> np.ndarray:
     rgb = np.array(image.convert("RGB"))
@@ -58,619 +257,1147 @@ def pil_to_cv2(image: Image.Image) -> np.ndarray:
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
-    img = pil_to_cv2(image)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return Image.fromarray(thr)
+    """
+    Prétraitement utilisé uniquement pour le fallback OCR :
+    gris + réduction du bruit + binarisation Otsu.
+    """
+    image_cv = pil_to_cv2(image)
+
+    gray = cv2.cvtColor(
+        image_cv,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    gray = cv2.GaussianBlur(
+        gray,
+        (3, 3),
+        0,
+    )
+
+    binary = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )[1]
+
+    return Image.fromarray(binary)
 
 
-def load_pages_from_upload(uploaded_file) -> List[Image.Image]:
-    suffix = uploaded_file.name.lower()
-    data = uploaded_file.read()
+def load_pages_from_bytes(
+    file_bytes: bytes,
+    filename: str,
+) -> List[Image.Image]:
+    """
+    Convertit le PDF en images pour la visualisation et l'OCR fallback.
+    """
+    suffix = filename.lower()
 
     if suffix.endswith(".pdf"):
         if convert_from_bytes is None:
-            raise RuntimeError("Le paquet python 'pdf2image' n'est pas installé.")
+            raise RuntimeError(
+                "Le paquet 'pdf2image' n'est pas installé."
+            )
+
         if not os.path.exists(POPPLER_PATH):
-            raise RuntimeError(f"Poppler est introuvable au chemin : {POPPLER_PATH}")
-        try:
-            return convert_from_bytes(data, dpi=220, poppler_path=POPPLER_PATH)
-        except Exception as e:
-            raise RuntimeError(f"Erreur de conversion PDF avec Poppler : {e}")
+            raise RuntimeError(
+                f"Poppler est introuvable : {POPPLER_PATH}"
+            )
 
-    return [Image.open(io.BytesIO(data)).convert("RGB")]
+        return convert_from_bytes(
+            file_bytes,
+            dpi=300,
+            poppler_path=POPPLER_PATH,
+        )
+
+    return [
+        Image.open(
+            io.BytesIO(file_bytes)
+        ).convert("RGB")
+    ]
 
 
 # =========================
-# OCR — deux passes : bruts + fusionnés
+# Lecture directe du PDF
 # =========================
-def run_tesseract_ocr_raw(image: Image.Image) -> List[OCRBlock]:
-    """Retourne les blocs OCR bruts (sans fusion)."""
-    if pytesseract is None:
-        raise RuntimeError("Le paquet python 'pytesseract' n'est pas installé.")
-    if not os.path.exists(TESSERACT_CMD):
-        raise RuntimeError(f"Tesseract est introuvable : {TESSERACT_CMD}")
+def extract_embedded_pdf_text(file_bytes: bytes) -> str:
+    """
+    Lit le texte natif intégré au PDF avec PyMuPDF.
+
+    Cette méthode est prioritaire car elle évite les erreurs OCR
+    comme 1 lu comme 4 ou les colonnes mélangées.
+    """
+    if fitz is None:
+        return ""
 
     try:
-        data = pytesseract.image_to_data(
-            image,
-            output_type=pytesseract.Output.DICT,
-            # psm 6 = bloc de texte uniforme
-            # psm 11 = sparse text — utile pour les tableaux / mise en page complexe
-            config="--oem 3 --psm 6 -l spa+eng",
+        document = fitz.open(
+            stream=file_bytes,
+            filetype="pdf",
         )
-    except Exception as e:
-        raise RuntimeError(f"Tesseract a échoué : {e}")
+
+        return "\n".join(
+            page.get_text("text")
+            for page in document
+        )
+
+    except Exception:
+        return ""
+
+
+# =========================
+# OCR fallback
+# =========================
+def run_tesseract_ocr_raw(
+    image: Image.Image,
+    psm: int = 11,
+) -> List[OCRBlock]:
+    """
+    Retourne les mots et leurs positions.
+    Cette partie sert surtout à la visualisation.
+    """
+    if pytesseract is None:
+        raise RuntimeError(
+            "Le paquet 'pytesseract' n'est pas installé."
+        )
+
+    if not os.path.exists(TESSERACT_CMD):
+        raise RuntimeError(
+            f"Tesseract est introuvable : {TESSERACT_CMD}"
+        )
+
+    data = pytesseract.image_to_data(
+        image,
+        output_type=pytesseract.Output.DICT,
+        config=f"--oem 3 --psm {psm} -l spa+eng",
+    )
 
     blocks: List[OCRBlock] = []
-    n = len(data["text"])
 
-    for i in range(n):
-        text = str(data["text"][i]).strip()
-        conf_raw = str(data["conf"][i]).strip()
+    for index, raw_text in enumerate(data["text"]):
+        text = str(raw_text).strip()
 
         if not text:
             continue
 
         try:
-            conf = max(0.0, min(1.0, float(conf_raw) / 100.0))
+            confidence = max(
+                0.0,
+                min(
+                    1.0,
+                    float(data["conf"][index]) / 100.0,
+                ),
+            )
         except Exception:
-            conf = 0.0
+            confidence = 0.0
 
-        blocks.append(OCRBlock(
-            text=text,
-            x=int(data["left"][i]),
-            y=int(data["top"][i]),
-            w=int(data["width"][i]),
-            h=int(data["height"][i]),
-            confidence=conf,
-        ))
+        blocks.append(
+            OCRBlock(
+                text=text,
+                x=int(data["left"][index]),
+                y=int(data["top"][index]),
+                w=int(data["width"][index]),
+                h=int(data["height"][index]),
+                confidence=confidence,
+            )
+        )
 
     return blocks
 
 
-def run_tesseract_ocr(image: Image.Image) -> Tuple[List[OCRBlock], List[OCRBlock]]:
-    """
-    nretourniw (blocs_bruts, blocs_fusionnés).
-    """
-    raw = run_tesseract_ocr_raw(image)
-    merged = merge_nearby_words(raw, y_tol=12, x_gap=80)
-    return raw, merged
-
-
 def merge_nearby_words(
-        blocks: List[OCRBlock],
-        y_tol: int = 12,
-        x_gap: int = 80,
+    blocks: List[OCRBlock],
+    y_tolerance: int = 12,
+    x_gap: int = 55,
 ) -> List[OCRBlock]:
-    """nfusionniw les mots proches sur la même ligne."""
+    """
+    Fusion prudente des mots proches sur une même ligne.
+
+    x_gap=55 évite de fusionner plusieurs colonnes éloignées.
+    """
     if not blocks:
         return []
 
-    blocks = sorted(blocks, key=lambda b: (b.y, b.x))
+    ordered = sorted(
+        blocks,
+        key=lambda block: (block.y, block.x),
+    )
+
     merged: List[OCRBlock] = []
-    current = blocks[0]
+    current = ordered[0]
 
-    for b in blocks[1:]:
-        same_line = abs(b.y - current.y) <= y_tol
-        near_x = b.x <= current.x + current.w + x_gap
+    for candidate in ordered[1:]:
+        same_line = (
+            abs(candidate.y - current.y)
+            <= y_tolerance
+        )
 
-        if same_line and near_x:
-            new_text = f"{current.text} {b.text}".strip()
-            x1 = min(current.x, b.x)
-            y1 = min(current.y, b.y)
-            x2 = max(current.x + current.w, b.x + b.w)
-            y2 = max(current.y + current.h, b.y + b.h)
-            new_conf = (current.confidence + b.confidence) / 2.0
-            current = OCRBlock(new_text, x1, y1, x2 - x1, y2 - y1, new_conf)
+        close_horizontally = (
+            0
+            <= candidate.x - (current.x + current.w)
+            <= x_gap
+        )
+
+        if same_line and close_horizontally:
+            x1 = min(current.x, candidate.x)
+            y1 = min(current.y, candidate.y)
+            x2 = max(
+                current.x + current.w,
+                candidate.x + candidate.w,
+            )
+            y2 = max(
+                current.y + current.h,
+                candidate.y + candidate.h,
+            )
+
+            current = OCRBlock(
+                text=(
+                    f"{current.text} {candidate.text}"
+                    .strip()
+                ),
+                x=x1,
+                y=y1,
+                w=x2 - x1,
+                h=y2 - y1,
+                confidence=(
+                    current.confidence
+                    + candidate.confidence
+                ) / 2.0,
+            )
+
         else:
             merged.append(current)
-            current = b
+            current = candidate
 
     merged.append(current)
+
     return merged
 
 
-# =========================
-# Visualization
-# =========================
 def draw_boxes(
-        image: Image.Image,
-        blocks: List[OCRBlock],
-        min_conf: float = 0.0,
+    image: Image.Image,
+    blocks: List[OCRBlock],
+    minimum_confidence: float,
 ) -> Image.Image:
-    vis = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(vis)
+    visual = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(visual)
 
     for block in blocks:
-        if block.confidence < min_conf:
+        if block.confidence < minimum_confidence:
             continue
+
         draw.rectangle(
-            [block.x, block.y, block.x + block.w, block.y + block.h],
+            [
+                block.x,
+                block.y,
+                block.x + block.w,
+                block.y + block.h,
+            ],
             outline=(255, 0, 0),
             width=2,
         )
-    return vis
+
+    return visual
 
 
-# =========================
-# Anchors
-# =========================
-ANCHORS: dict[str, List[str]] = {
-    "protocol_number": [
-        "nº protocolo", "no protocolo", "n° protocolo",
-        "num protocolo", "protocolo",
-        "n protocolo",
-    ],
-    "invoice_number": [
-        # Notaire : bloc "FACTURA" suivi de "22600767-A"
-        "factura",
-        # Facture 1 : "Nº Factura: B 1474"
-        "nº factura", "no factura", "n° factura",
-        "numero factura", "número factura", "n factura",
-        # Facture 2 : "NÚMERO: 1.726"
-        "número:", "numero:", "número :", "numero :",
-        "factura serie",
-    ],
-    "invoice_date": [
-        # Notaire : date dans le bloc FACTURA ou Protocolo
-        "factura", "protocolo",
-        # Standard
-        "fecha factura", "fecha firma",
-        "fecha:", "fecha :", "fecha",
-        "del:", "del :",
-    ],
-    "net_amount": [
-        # Notaire : "Liquido:  881,59 €"
-        "liquido:", "liquido :", "líquido:", "líquido :",
-        "liquido", "líquido",
-        # Facture 2 : "TOTAL A COBRAR: 558,22 €"
-        "total a cobrar",
-        # Facture 1
-        "importe neto", "importe total",
-        # Générique
-        "total",
-    ],
-}
-
-
-# =========================
-# Normalisation
-# =========================
-def normalize_text(text: str) -> str:
-
-    t = text.lower()
-    for src, dst in [
-        ("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"),
-        ("ú", "u"), ("ü", "u"), ("ñ", "n"),
-        # Caractères parasites courants en OCR
-        ("\u00ba", "o"),  # º → o
-        ("\u00aa", "a"),  # ª → a
-        ("°", "o"),
-    ]:
-        t = t.replace(src, dst)
-    # Normalise les tirets OCR en tiret ASCII
-    t = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\ufe58\ufe63\uff0d]", "-", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def clean_amount(text: str) -> str:
-    """nahiw symboles monétaires, espaces et caractères parasites."""
-    return re.sub(r"[€$£\s\u00a0]", "", text).strip()
-
-
-# =========================
-# Scoring bel fallback token-par-token
-# =========================
-def anchor_score(text: str, anchors: List[str]) -> float:
-    t = normalize_text(text)
-    for a in anchors:
-        na = normalize_text(a)
-        if na in t:
-            return 1.0
-    return 0.0
-
-
-def format_score(field_name: str, candidate: str) -> float:
+def ocr_pages_to_text(
+    pages: List[Image.Image],
+    apply_preprocessing: bool,
+) -> str:
     """
-    nchoufou ke, le texte candidat correspond au format attendu.
-    NOUVEAU : essaie aussi chaque token individuel si le texte complet échoue.
+    OCR de secours pour les scans ou images.
+
+    Toutes les pages sont traitées, pas seulement la page affichée.
     """
-    score = _format_score_single(field_name, candidate.strip())
-    if score > 0:
-        return score
+    if pytesseract is None:
+        return ""
 
-    # njarbou kol token du candidat séparément
-    tokens = candidate.strip().split()
-    for tok in tokens:
-        s = _format_score_single(field_name, tok.strip())
-        if s > 0:
-            return s * 0.9  # naamlou pénalité khtr extraction approximative
+    page_texts: List[str] = []
 
-    return 0.0
+    for page in pages:
+        source = (
+            preprocess_image(page)
+            if apply_preprocessing
+            else page
+        )
 
+        text = pytesseract.image_to_string(
+            source,
+            config="--oem 3 --psm 11 -l spa+eng",
+        )
 
-def _format_score_single(field_name: str, text: str) -> float:
-    """nverifiw l format taa texte unique ."""
-    text = text.strip()
+        page_texts.append(text)
 
-    if field_name == "invoice_date":
-        if re.search(r"\d{2}/\d{2}/\d{2,4}", text):
-            return 1.0
-        if re.search(r"\d{1,2}-\d{1,2}-\d{2,4}", text):
-            return 1.0
-        return 0.0
-
-    if field_name == "net_amount":
-        cleaned = clean_amount(text)
-        if re.match(r"^[-+]?\d{1,3}(?:[.,]\d{3})*[.,]\d{2}$", cleaned):
-            return 1.0
-        if re.match(r"^\d+[,.]\d{2}$", cleaned):
-            return 1.0
-        return 0.0
-
-    if field_name == "protocol_number":
-        normalized = re.sub(r"[.\s:]", "", text)
-        if re.fullmatch(r"\d{2,10}", normalized):
-            return 1.0
-        return 0.0
-
-    if field_name == "invoice_number":
-        normalized = text.replace(":", "").strip()
-
-        if re.fullmatch(r"\d{4,10}-[A-Za-z]{1,4}", normalized):
-            return 1.0
-
-        if re.fullmatch(r"[A-Za-z]{1,4}\s?\d{1,10}", normalized):
-            return 1.0
-
-        if re.fullmatch(r"[A-Za-z]{0,4}\s?\d{1,3}(?:\.\d{3})*", normalized):
-            return 1.0
-        if re.fullmatch(r"\d{1,10}", normalized.replace(".", "")):
-            return 1.0
-        return 0.0
-
-    return 0.0
+    return "\n".join(page_texts)
 
 
-def bad_candidate_penalty(text: str) -> float:
-    t = normalize_text(text)
-    penalties = [
-        "calle", "cl ", "palma", "baleares", "union", "fax", "email",
-        "otros", "papel", "copias", "honorarios", "conceptos",
-        "notario", "norma", "cuenta", "banca", "sabadell", "santander",
-        "avda", "avd.", "telefono", "tf.", "nif", "c.i.f",
-        "doctor", "oviedo", "asturias",
+# =========================
+# Détection de la famille
+# =========================
+def detect_document_family(document_text: str) -> str:
+    """
+    Distingue les factures de registre et les factures notariales.
+    """
+    normalized = normalize_text(document_text)
+
+    registry_markers = [
+        "registro de la propiedad",
+        "el registrador",
+        "registrador titular",
     ]
-    for p in penalties:
-        if p in t:
-            return 0.0
-    return 1.0
+
+    if any(
+        marker in normalized
+        for marker in registry_markers
+    ):
+        return "registry"
+
+    return "notary"
 
 
 # =========================
-# Extracteurs inline
+# Extraction facture registre
 # =========================
-def extract_value_from_same_block(
-        anchor_text: str, field_name: str
-) -> Optional[str]:
-    t = anchor_text.strip()
+def extract_registry_fields(
+    document_text: str,
+) -> Dict[str, object]:
+    lines = clean_lines(document_text)
+    text = "\n".join(lines)
 
-    patterns: dict[str, List[str]] = {
-        "protocol_number": [
-            r"(?:n[ºo°°]?\s*protocolo)\s*[:\-]?\s*([0-9][0-9.]*)",
-            r"(?:protocolo)\s*[:\-]?\s*([0-9][0-9.]*)",
-        ],
-        "invoice_number": [
-            # "FACTURA  22600767-A  24/03/26" → capture "22600767-A"
-            r"(?:factura)\s+(\d{4,10}-[A-Za-z]{1,4})",
-            # "Nº Factura: B 1474"
-            r"(?:n[ºo°°]?\s*factura)\s*[:\-]?\s*([A-Za-z]{1,4}\s?\d{1,10})",
-            r"(?:n[ºo°°]?\s*factura)\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*)",
-            # "NÚMERO: 1.726"
-            r"(?:n[úu]mero)\s*[:\-]?\s*([A-Za-z]{0,4}\s?\d{1,3}(?:\.\d{3})*)",
-            r"(?:factura\s*serie\s*[a-z]?)\s*(?:n[úu]mero)\s*[:\-]?\s*(\d{1,3}(?:\.\d{3})*)",
-        ],
-        "invoice_date": [
-            # "FACTURA  22600767-A  24/03/26" → capture la date
-            r"(?:factura|protocolo)\s+\S+\s+(\d{2}/\d{2}/\d{2,4})",
-            # Protocolo seul sur même ligne : "Protocolo 22600767  24/03/26"
-            r"(?:protocolo)\s+\d+\s+(\d{2}/\d{2}/\d{2,4})",
-            r"(?:fecha\s*factura)\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})",
-            r"(?:fecha\s*firma)\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})",
-            r"(?:del|fecha)\s*[:\-]?\s*(\d{2}/\d{2}/\d{2,4})",
-            r"(?:del|fecha)\s*[:\-]?\s*(\d{1,2}-\d{1,2}-\d{2,4})",
-            r"(\d{2}/\d{2}/\d{2,4})",
-        ],
-        "net_amount": [
-            r"(?:l[íi]quido)\s*[:\-]?\s*([-+]?\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€?",
-            r"(?:total\s*a\s*cobrar)\s*[:\-]?\s*([-+]?\d{1,3}(?:[.,]\d{3})*[.,]\d{2})",
-            r"(?:importe\s*(?:neto|total))\s*€?\s*[:\-]?\s*([-+]?\d{1,3}(?:[.,]\d{3})*[.,]\d{2})",
-            r"([-+]?\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€",
-        ],
-    }
+    issuer_name: Optional[str] = None
 
-    for p in patterns.get(field_name, []):
-        m = re.search(p, t, flags=re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+    for index, line in enumerate(lines):
+        if re.fullmatch(
+            r"El Registrador(?: Titular)?",
+            line,
+            re.IGNORECASE,
+        ):
+            if index + 1 < len(lines):
+                issuer_name = lines[index + 1]
+                break
 
-    return None
+    nif_cif = first_regex(
+        r"N\.?\s*I\.?\s*F\.?\s*:"
+        r"\s*([A-Z]?\d{7,8}[A-Z0-9]?)",
+        text,
+    )
 
+    if nif_cif:
+        nif_cif = nif_cif.upper()
 
-# =========================
-# Recherche spatiale — MULTI-STRATÉGIE
-# Stratégies :
-#   1. Inline dans le même bloc
-#   2. Blocs à droite (même ligne)
-#   3. Blocs en-dessous (colonne)
-#   4. Reconstruction ligne virtuelle
-#   5. Reconstruction colonne virtuelle
-# =========================
-def find_candidate_near_anchor(
-        raw_blocks: List[OCRBlock],
-        merged_blocks: List[OCRBlock],
-        field_name: str,
-) -> Tuple[Optional[str], float]:
-    """
-    nlawjou la valeur d'un champ en combinant blocs bruts et fusionnés,
-    b 5 stratégies spatiales différentes.
-    """
-    anchors = ANCHORS[field_name]
-    best_value: Optional[str] = None
-    best_score: float = -1.0
+    invoice_header = re.search(
+        rf"SERIE\s*\n"
+        rf"NUM FACTURA\s*\n"
+        rf"FECHA\s*\n"
+        rf"([A-Z])\s*\n"
+        rf"(\d+)\s*\n"
+        rf"({DATE_PATTERN})",
+        text,
+        re.IGNORECASE,
+    )
 
-    # nlawjou ala les blocs fusionnés ET les blocs bruts li les ancres
-    for source_blocks in (merged_blocks, raw_blocks):
-        for anchor_block in source_blocks:
-            a_score = anchor_score(anchor_block.text, anchors)
-            if a_score <= 0:
-                continue
+    invoice_number = None
+    invoice_date = None
 
-            # Stratégie 1 : extraction inline
-            same_block_value = extract_value_from_same_block(anchor_block.text, field_name)
-            if same_block_value is not None:
-                f_score = format_score(field_name, same_block_value)
-                if f_score > 0:
-                    score = 0.45 * anchor_block.confidence + 0.30 * a_score + 0.25 * f_score
-                    if score > best_score:
-                        best_score = score
-                        best_value = same_block_value
+    if invoice_header:
+        invoice_number = (
+            f"{invoice_header.group(1).upper()} "
+            f"{invoice_header.group(2)}"
+        )
 
-            # nlawjou parmi tous les blocs candidats (bruts + fusionnés)
-            all_candidates = list(raw_blocks) + list(merged_blocks)
+        invoice_date = invoice_header.group(3)
 
-            for candidate in all_candidates:
-                if candidate is anchor_block:
-                    continue
+    else:
+        flattened = re.sub(
+            r"\s+",
+            " ",
+            text,
+        )
 
-                dx = candidate.x - anchor_block.x
-                dy = candidate.y - anchor_block.y
+        invoice_header = re.search(
+            rf"SERIE\s+"
+            rf"NUM FACTURA\s+"
+            rf"FECHA\s+"
+            rf"([A-Z])\s+"
+            rf"(\d+)\s+"
+            rf"({DATE_PATTERN})",
+            flattened,
+            re.IGNORECASE,
+        )
 
-                #  Stratégie 2 : à droite sur la même ligne
-                right_side = (0 <= dx <= 700) and (abs(dy) <= 35)
+        if invoice_header:
+            invoice_number = (
+                f"{invoice_header.group(1).upper()} "
+                f"{invoice_header.group(2)}"
+            )
 
-                #  Stratégie 3 : en-dessous dans la même colonne
-                # hethi pour les tableaux notariats où le label est
-                # en haut et la valeur en-dessous
-                same_column = (abs(dx) <= 80) and (0 < dy <= 100)
+            invoice_date = invoice_header.group(3)
 
-                # Stratégie 4 : légèrement en-dessous et à droite
-                below_right = (0 <= dx <= 400) and (0 < dy <= 80)
+    protocol_number = first_regex(
+        r"N[ºo°]\s*Protocolo\s*:"
+        r"\s*(\d+\s*/\s*\d{4})",
+        text,
+    )
 
-                if not (right_side or same_column or below_right):
-                    continue
+    if protocol_number:
+        protocol_number = re.sub(
+            r"\s+",
+            " ",
+            protocol_number,
+        )
 
-                f_score = format_score(field_name, candidate.text)
-                if f_score <= 0:
-                    continue
+    base_amount = first_regex(
+        rf"BASE IMPONIBLE"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+    )
 
-                penalty = bad_candidate_penalty(candidate.text)
-                if penalty <= 0:
-                    continue
+    iva_match = re.search(
+        rf"IMPORTE\s+"
+        rf"I\.?\s*V\.?\s*A\.?"
+        rf"\s*\(\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*\)"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
 
-                distance = abs(dx) + abs(dy)
+    iva_percentage = (
+        normalize_percentage(
+            iva_match.group(1)
+        )
+        if iva_match
+        else None
+    )
 
-                if right_side:
-                    max_dist = 735.0
-                    spatial = max(0.0, 1.0 - distance / max_dist)
-                    layout_bonus = 1.0
-                elif same_column:
-                    max_dist = 180.0
-                    spatial = max(0.0, 1.0 - distance / max_dist)
-                    layout_bonus = 0.85  # légère pénalité car moins fiable
-                else:  # below_right
-                    max_dist = 480.0
-                    spatial = max(0.0, 1.0 - distance / max_dist)
-                    layout_bonus = 0.90
+    iva_amount = (
+        iva_match.group(2)
+        if iva_match
+        else None
+    )
 
-                score = (
-                    0.35 * candidate.confidence
-                    + 0.25 * a_score
-                    + 0.25 * spatial
-                    + 0.15 * f_score
-                ) * penalty * layout_bonus
+    retention_match = re.search(
+        rf"IMPORTE\s+"
+        rf"(?:IRPF|RETENCI[ÓO]N)"
+        rf"\s*\(\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*\)"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
 
-                if score > best_score:
-                    best_score = score
-                    best_value = _extract_best_token(field_name, candidate.text)
+    if retention_match:
+        retention_percentage = normalize_percentage(
+            retention_match.group(1)
+        )
 
-            # Stratégie 5 : reconstruction de la ligne virtuelle
-            if best_value is None:
-                same_row_text = " ".join(
-                    b.text for b in sorted(raw_blocks + merged_blocks, key=lambda b: b.x)
-                    if abs(b.y - anchor_block.y) <= 20
-                )
-                inline = extract_value_from_same_block(same_row_text, field_name)
-                if inline:
-                    f_score = format_score(field_name, inline)
-                    if f_score > 0:
-                        score = 0.40 * anchor_block.confidence + 0.35 * a_score + 0.25 * f_score
-                        if score > best_score:
-                            best_score = score
-                            best_value = inline
+        retention_float = amount_to_float(
+            retention_match.group(2)
+        )
 
-            # Stratégie 6 : reconstruction de la colonne virtuelle
-            # nregroupiw les blocs lkol f la même plage X kif l'ancre
-            if best_value is None:
-                ax_center = anchor_block.x + anchor_block.w // 2
-                col_tolerance_x = max(anchor_block.w // 2, 60)
-                col_blocks = [
-                    b for b in sorted(raw_blocks + merged_blocks, key=lambda b: b.y)
-                    if abs((b.x + b.w // 2) - ax_center) <= col_tolerance_x
-                    and b.y > anchor_block.y
-                ]
-                for col_block in col_blocks[:5]:  # nlimitiw à 5 blocs sous l'ancre
-                    col_inline = extract_value_from_same_block(col_block.text, field_name)
-                    candidate_text = col_inline if col_inline else col_block.text
-                    f_score = format_score(field_name, candidate_text)
-                    if f_score > 0:
-                        score = (
-                            0.40 * col_block.confidence
-                            + 0.30 * a_score
-                            + 0.20 * f_score
-                            + 0.10 * max(0.0, 1.0 - (col_block.y - anchor_block.y) / 300)
-                        )
-                        if score > best_score:
-                            best_score = score
-                            best_value = candidate_text
+        retention_amount = format_european_amount(
+            abs(retention_float)
+            if retention_float is not None
+            else None
+        )
 
-    if best_value is None:
-        return None, 0.0
-    return best_value, min(best_score, 1.0)
+        retention_source = "direct_pdf_text"
+        retention_confidence = 0.99
 
+    else:
+        retention_percentage = "0,00"
+        retention_amount = "0,00"
+        retention_source = "default_absent_label"
+        retention_confidence = 0.85
 
-def _extract_best_token(field_name: str, text: str) -> str:
-    """
-    Si le bloc contient plusieurs tokens, retourne celui qui correspond
-    au format attendu (ex : "22600767-A 24/03/26" → "22600767-A" pour invoice_number).
-    Sinon retourne le texte complet.
-    """
-    tokens = text.strip().split()
-    for tok in tokens:
-        if _format_score_single(field_name, tok) > 0:
-            return tok
-    return text
+    # Règle métier :
+    # sans base de rétention spécifique,
+    # la base de rétention = base imposable.
+    retention_base_amount = base_amount
 
+    non_taxable_amount = first_regex(
+        rf"(?:"
+        rf"IMPORTE\s+NO\s+SUJETO"
+        rf"|BASE\s+EXENTA\s+IVA"
+        rf")"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+    )
 
-# =========================
-# Post-traitement taa le valeurs extraites
-# =========================
-def postprocess(field_name: str, value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
+    if non_taxable_amount is None:
+        non_taxable_amount = "0,00"
+        non_taxable_source = "default_absent_label"
+        non_taxable_confidence = 0.85
 
-    if field_name == "net_amount":
-        return clean_amount(value)
+    else:
+        non_taxable_source = "direct_pdf_text"
+        non_taxable_confidence = 0.99
 
-    if field_name in ("protocol_number", "invoice_number"):
-        return value.strip(" :.-")
-
-    if field_name == "invoice_date":
-        m = re.search(r"\d{2}/\d{2}/\d{2,4}", value)
-        if m:
-            return m.group(0)
-        m = re.search(r"\d{1,2}-\d{1,2}-\d{2,4}", value)
-        if m:
-            return m.group(0)
-        return value
-
-    return value
-
-
-# =========================
-# Agrégation des scores
-# =========================
-def average_scores(scores: List[float]) -> float:
-    valid = [s for s in scores if s is not None]
-    if not valid:
-        return 0.0
-    return float(sum(valid) / len(valid))
-
-
-# =========================
-# lihne naamlou extraction taa MVP principale
-# =========================
-def extract_mvp_fields(raw_blocks: List[OCRBlock], merged_blocks: List[OCRBlock]) -> dict:
-    protocol_number, protocol_number_conf = find_candidate_near_anchor(raw_blocks, merged_blocks, "protocol_number")
-    invoice_number, invoice_number_conf = find_candidate_near_anchor(raw_blocks, merged_blocks, "invoice_number")
-    invoice_date, invoice_date_conf = find_candidate_near_anchor(raw_blocks, merged_blocks, "invoice_date")
-    net_amount, net_amount_conf = find_candidate_near_anchor(raw_blocks, merged_blocks, "net_amount")
-
-    protocol_number = postprocess("protocol_number", protocol_number)
-    invoice_number = postprocess("invoice_number", invoice_number)
-    invoice_date = postprocess("invoice_date", invoice_date)
-    net_amount = postprocess("net_amount", net_amount)
-
-    invoice_ref_block = average_scores([protocol_number_conf, invoice_number_conf, invoice_date_conf])
-    financial_block = average_scores([net_amount_conf])
-    global_conf = average_scores([invoice_ref_block, financial_block])
+    net_amount = first_regex(
+        rf"(?m)^TOTAL"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+    )
 
     return {
+        "document_family": "registry",
+
         "invoice_reference": {
-            "protocol_number": {"value": protocol_number, "confidence": round(protocol_number_conf, 3)},
-            "invoice_number": {"value": invoice_number, "confidence": round(invoice_number_conf, 3)},
-            "invoice_date": {"value": invoice_date, "confidence": round(invoice_date_conf, 3)},
-            "block_confidence": round(invoice_ref_block, 3),
+            "issuer_name": field(
+                issuer_name,
+                0.99,
+                "header_after_registrador",
+            ),
+
+            "nif_cif": field(
+                nif_cif,
+                0.99,
+                "first_issuer_nif",
+            ),
+
+            "protocol_number": field(
+                protocol_number,
+                0.99,
+                "direct_pdf_text",
+            ),
+
+            "invoice_number": field(
+                invoice_number,
+                0.99,
+                "series_number_header",
+            ),
+
+            "invoice_date": field(
+                invoice_date,
+                0.99,
+                "series_number_header",
+            ),
         },
+
         "financial": {
-            "net_amount": {"value": net_amount, "confidence": round(net_amount_conf, 3)},
-            "block_confidence": round(financial_block, 3),
+            "base_amount": field(
+                base_amount,
+                0.99,
+                "summary_label",
+            ),
+
+            "retention_base_amount": field(
+                retention_base_amount,
+                0.90,
+                "business_default_base_amount",
+            ),
+
+            "iva_percentage": field(
+                iva_percentage,
+                0.99,
+                "summary_label",
+            ),
+
+            "retention_percentage": field(
+                retention_percentage,
+                retention_confidence,
+                retention_source,
+            ),
+
+            "iva_amount": field(
+                iva_amount,
+                0.99,
+                "summary_label",
+            ),
+
+            "retention_amount": field(
+                retention_amount,
+                retention_confidence,
+                retention_source,
+            ),
+
+            "non_taxable_amount": field(
+                non_taxable_amount,
+                non_taxable_confidence,
+                non_taxable_source,
+            ),
+
+            "net_amount": field(
+                net_amount,
+                0.99,
+                "total_summary_label",
+            ),
         },
-        "global_confidence": round(global_conf, 3),
     }
 
 
 # =========================
-# Debug helper
+# Extraction facture notaire
 # =========================
-def debug_show_all_blocks(raw_blocks: List[OCRBlock], merged_blocks: List[OCRBlock]) -> None:
-    st.subheader(" Debug — blocs bruts OCR")
-    rows_raw = [{"text": b.text, "x": b.x, "y": b.y, "w": b.w, "h": b.h, "confidence": round(b.confidence, 3)} for b in raw_blocks]
-    st.dataframe(pd.DataFrame(rows_raw), use_container_width=True)
+def extract_notary_fields(
+    document_text: str,
+) -> Dict[str, object]:
+    lines = clean_lines(document_text)
+    text = "\n".join(lines)
 
-    st.subheader(" Debug — blocs fusionnés OCR")
-    rows_merged = [{"text": b.text, "x": b.x, "y": b.y, "w": b.w, "h": b.h, "confidence": round(b.confidence, 3)} for b in merged_blocks]
-    st.dataframe(pd.DataFrame(rows_merged), use_container_width=True)
+    # Le nom du notaire est généralement la première ligne.
+    issuer_name = (
+        lines[0]
+        if lines
+        else None
+    )
 
-    st.subheader(" Debug — scores ancres par champ (blocs fusionnés)")
-    for field, anchors in ANCHORS.items():
-        st.write(f"**{field}**")
-        hits = [
-            (b.text, round(anchor_score(b.text, anchors), 2), round(b.confidence, 2))
-            for b in merged_blocks
-            if anchor_score(b.text, anchors) > 0
-        ]
-        if hits:
-            st.dataframe(pd.DataFrame(hits, columns=["bloc", "anchor_score", "conf"]), use_container_width=True)
+    nif_cif = first_regex(
+        r"(?:"
+        r"C\.?\s*I\.?\s*F\.?"
+        r"|N\.?\s*I\.?\s*F\.?"
+        r")"
+        r"\s*[:.]?\s*"
+        r"([A-Z]?\d{7,8}[A-Z0-9]?)",
+        text,
+    )
+
+    if nif_cif:
+        nif_cif = nif_cif.upper()
+
+    protocol_number = first_regex(
+        r"N[ºo°]\s*Protocolo"
+        r"\s*:\s*([^\n]+)",
+        text,
+    )
+
+    if protocol_number is None:
+        protocol_number = first_regex(
+            r"(?m)^Protocolo"
+            r"\s*\n?\s*"
+            r"(\d{3,10})",
+            text,
+        )
+
+    invoice_number = first_regex(
+        r"N[ºo°]\s*Factura"
+        r"\s*:\s*([^\n]+)",
+        text,
+    )
+
+    if invoice_number is None:
+        invoice_number = first_regex(
+            r"(?m)^FACTURA"
+            r"\s*\n?\s*"
+            r"(\d{4,10}-[A-Z]{1,4})",
+            text,
+        )
+
+    invoice_date = first_regex(
+        rf"Fecha\s+Factura"
+        rf"\s*:\s*"
+        rf"({DATE_PATTERN})",
+        text,
+    )
+
+    if (
+        invoice_date is None
+        and invoice_number is not None
+    ):
+        invoice_date = first_regex(
+            rf"{re.escape(invoice_number)}"
+            rf"\s+({DATE_PATTERN})",
+            re.sub(
+                r"\s+",
+                " ",
+                text,
+            ),
+        )
+
+    # Layout notarial avec les titres puis les valeurs en dessous.
+    summary_match = re.search(
+        rf"Base Exenta IVA"
+        rf"\s*\n"
+        rf"Base imponible"
+        rf"\s*\n"
+        rf"Impuestos"
+        rf"\s*\n"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?"
+        rf"\s*\n"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?"
+        rf"\s*\n"
+        rf"IVA\s*\(\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*\)"
+        rf"\s*\n"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+
+    if summary_match:
+        non_taxable_amount = summary_match.group(1)
+        base_amount = summary_match.group(2)
+
+        iva_percentage = normalize_percentage(
+            summary_match.group(3)
+        )
+
+        iva_amount = summary_match.group(4)
+
+    else:
+        # Fallback pour les factures du type :
+        # BASE 820,51
+        # IVA[21%](B.Imponible: 820,51) 172,31
+        base_amount = last_regex(
+            rf"(?m)^BASE"
+            rf"(?:\s+IMPONIBLE)?"
+            rf"\s*[:\-]?\s*"
+            rf"({AMOUNT_PATTERN})",
+            text,
+        )
+
+        iva_line_match = re.search(
+            rf"IVA"
+            rf"\s*[\[(]?\s*"
+            rf"({PERCENT_PATTERN})"
+            rf"\s*%"
+            rf"[^\n]*?"
+            rf"({AMOUNT_PATTERN})"
+            rf"\s*€?\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+
+        iva_percentage = (
+            normalize_percentage(
+                iva_line_match.group(1)
+            )
+            if iva_line_match
+            else None
+        )
+
+        iva_amount = (
+            iva_line_match.group(2)
+            if iva_line_match
+            else None
+        )
+
+        non_taxable_amount = first_regex(
+            rf"(?:"
+            rf"IMPORTE\s+NO\s+SUJETO"
+            rf"|BASE\s+EXENTA\s+IVA"
+            rf")"
+            rf"\s*[:\-]?\s*"
+            rf"({AMOUNT_PATTERN})",
+            text,
+        )
+
+        if non_taxable_amount is None:
+            non_taxable_amount = "0,00"
+
+    retention_match = re.search(
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?"
+        rf"\s*\n"
+        rf"RETENCI[ÓO]N"
+        rf"\s*\(\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*\)"
+        rf"\s*\n"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+
+    if retention_match:
+        retention_base_amount = retention_match.group(1)
+
+        retention_percentage = normalize_percentage(
+            retention_match.group(2)
+        )
+
+        retention_float = amount_to_float(
+            retention_match.group(3)
+        )
+
+        retention_amount = format_european_amount(
+            abs(retention_float)
+            if retention_float is not None
+            else None
+        )
+
+    else:
+        # Fallback pour :
+        # RETENCION:15% (B.Imponible 820,51) -123,08
+        retention_inline = re.search(
+            rf"RETENCI[ÓO]N"
+            rf"\s*[:\-]?\s*"
+            rf"({PERCENT_PATTERN})"
+            rf"\s*%"
+            rf"[^\n]*?"
+            rf"({AMOUNT_PATTERN})"
+            rf"[^\n]*?"
+            rf"({AMOUNT_PATTERN})"
+            rf"\s*$",
+            text,
+            re.IGNORECASE | re.MULTILINE,
+        )
+
+        if retention_inline:
+            retention_percentage = normalize_percentage(
+                retention_inline.group(1)
+            )
+
+            retention_base_amount = (
+                retention_inline.group(2)
+            )
+
+            retention_float = amount_to_float(
+                retention_inline.group(3)
+            )
+
+            retention_amount = format_european_amount(
+                abs(retention_float)
+                if retention_float is not None
+                else None
+            )
+
         else:
-            st.warning(f"Aucun ancre trouvé pour `{field}` dans les blocs fusionnés")
+            retention_base_amount = base_amount
+            retention_percentage = "0,00"
+            retention_amount = "0,00"
 
-    st.subheader(" Debug — test format_score sur chaque bloc")
-    for field in ANCHORS.keys():
-        hits = [
-            (b.text, round(format_score(field, b.text), 2))
-            for b in raw_blocks
-            if format_score(field, b.text) > 0
-        ]
-        if hits:
-            st.write(f"**{field}** — candidats valides :")
-            st.dataframe(pd.DataFrame(hits, columns=["bloc", "format_score"]), use_container_width=True)
+    # Selon la définition métier du boss,
+    # le net final correspond au montant à payer.
+    net_amount = first_regex(
+        rf"IMPORTE TOTAL"
+        rf"\s*€?"
+        rf"\s*\n?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+    )
 
+    if net_amount is None:
+        net_amount = first_regex(
+            rf"L[ÍI]QUIDO"
+            rf"\s*[:\-]?\s*"
+            rf"({AMOUNT_PATTERN})"
+            rf"\s*€?",
+            text,
+        )
+
+    return {
+        "document_family": "notary",
+
+        "invoice_reference": {
+            "issuer_name": field(
+                issuer_name,
+                0.98,
+                "document_header",
+            ),
+
+            "nif_cif": field(
+                nif_cif,
+                0.98,
+                "first_issuer_nif_cif",
+            ),
+
+            "protocol_number": field(
+                protocol_number,
+                0.98,
+                "reference_label",
+            ),
+
+            "invoice_number": field(
+                invoice_number,
+                0.98,
+                "reference_label",
+            ),
+
+            "invoice_date": field(
+                invoice_date,
+                0.98,
+                "reference_label",
+            ),
+        },
+
+        "financial": {
+            "base_amount": field(
+                base_amount,
+                0.98,
+                "financial_summary",
+            ),
+
+            "retention_base_amount": field(
+                retention_base_amount,
+                0.92,
+                "financial_summary_or_business_default",
+            ),
+
+            "iva_percentage": field(
+                iva_percentage,
+                0.98,
+                "financial_summary",
+            ),
+
+            "retention_percentage": field(
+                retention_percentage,
+                0.98,
+                "financial_summary",
+            ),
+
+            "iva_amount": field(
+                iva_amount,
+                0.98,
+                "financial_summary",
+            ),
+
+            "retention_amount": field(
+                retention_amount,
+                0.98,
+                "financial_summary",
+            ),
+
+            "non_taxable_amount": field(
+                non_taxable_amount,
+                0.90,
+                "financial_summary_or_zero_default",
+            ),
+
+            "net_amount": field(
+                net_amount,
+                0.98,
+                "final_payable_label",
+            ),
+        },
+    }
 
 
 # =========================
-# ngeneriw PDF report
+# Validation métier
 # =========================
-def generate_extraction_pdf(extraction: dict) -> bytes:
+def validate_and_reconcile(
+    extraction: Dict[str, object],
+) -> Tuple[Dict[str, object], List[str]]:
     """
-    Generate a clean PDF report with extracted invoice information.
-    Confidence scores are intentionally hidden from the exported report.
+    Vérifie les règles demandées :
+
+    IVA = Base imposable × % IVA
+
+    Rétention = Base rétention × % rétention
+
+    Neto = Base imposable
+           + IVA
+           + montant non soumis
+           - rétention
     """
+    financial = extraction["financial"]
+
+    base = amount_to_float(
+        financial["base_amount"]["value"]
+    )
+
+    retention_base = amount_to_float(
+        financial["retention_base_amount"]["value"]
+    )
+
+    iva_percentage = amount_to_float(
+        financial["iva_percentage"]["value"]
+    )
+
+    retention_percentage = amount_to_float(
+        financial["retention_percentage"]["value"]
+    )
+
+    iva_amount = amount_to_float(
+        financial["iva_amount"]["value"]
+    )
+
+    retention_amount = amount_to_float(
+        financial["retention_amount"]["value"]
+    )
+
+    non_taxable = amount_to_float(
+        financial["non_taxable_amount"]["value"]
+    )
+
+    net_amount = amount_to_float(
+        financial["net_amount"]["value"]
+    )
+
+    warnings: List[str] = []
+
+    non_taxable_for_calculation = (
+        non_taxable or 0.0
+    )
+
+    retention_for_calculation = (
+        retention_amount or 0.0
+    )
+
+    if (
+        base is not None
+        and iva_percentage is not None
+        and iva_amount is not None
+    ):
+        expected_iva = round(
+            base * iva_percentage / 100.0,
+            2,
+        )
+
+        if abs(expected_iva - iva_amount) > 0.06:
+            warnings.append(
+                "IVA incohérente : "
+                f"extraite={iva_amount:.2f}, "
+                f"calculée={expected_iva:.2f}."
+            )
+
+    if (
+        retention_base is not None
+        and retention_percentage is not None
+        and retention_amount is not None
+    ):
+        expected_retention = round(
+            retention_base
+            * retention_percentage
+            / 100.0,
+            2,
+        )
+
+        if (
+            abs(
+                expected_retention
+                - retention_amount
+            )
+            > 0.06
+        ):
+            warnings.append(
+                "Rétention incohérente : "
+                f"extraite={retention_amount:.2f}, "
+                f"calculée={expected_retention:.2f}."
+            )
+
+    if (
+        base is not None
+        and iva_amount is not None
+    ):
+        expected_net = round(
+            base
+            + iva_amount
+            + non_taxable_for_calculation
+            - retention_for_calculation,
+            2,
+        )
+
+        if net_amount is None:
+            financial["net_amount"] = field(
+                format_european_amount(
+                    expected_net
+                ),
+                0.88,
+                "derived_business_formula",
+            )
+
+        elif abs(expected_net - net_amount) > 0.08:
+            warnings.append(
+                "Net incohérent : "
+                f"extrait={net_amount:.2f}, "
+                f"calculé={expected_net:.2f}."
+            )
+
+    return extraction, warnings
+
+
+def calculate_global_confidence(
+    extraction: Dict[str, object],
+) -> float:
+    confidences: List[float] = []
+
+    for section_name in (
+        "invoice_reference",
+        "financial",
+    ):
+        section = extraction.get(
+            section_name,
+            {},
+        )
+
+        for result in section.values():
+            if (
+                isinstance(result, dict)
+                and result.get("value") is not None
+            ):
+                confidences.append(
+                    float(
+                        result.get(
+                            "confidence",
+                            0.0,
+                        )
+                    )
+                )
+
+    if not confidences:
+        return 0.0
+
+    return round(
+        sum(confidences) / len(confidences),
+        3,
+    )
+
+
+def extract_document(
+    document_text: str,
+    text_source: str,
+) -> Tuple[Dict[str, object], List[str]]:
+    """
+    Route le document vers le bon extracteur.
+    """
+    family = detect_document_family(
+        document_text
+    )
+
+    if family == "registry":
+        extraction = extract_registry_fields(
+            document_text
+        )
+
+    else:
+        extraction = extract_notary_fields(
+            document_text
+        )
+
+    extraction["text_source"] = text_source
+
+    extraction, warnings = validate_and_reconcile(
+        extraction
+    )
+
+    extraction["global_confidence"] = (
+        calculate_global_confidence(
+            extraction
+        )
+    )
+
+    return extraction, warnings
+
+
+# =========================
+# Export PDF
+# =========================
+def generate_extraction_pdf(
+    extraction: Dict[str, object],
+) -> bytes:
     buffer = io.BytesIO()
 
-    doc = SimpleDocTemplate(
+    document = SimpleDocTemplate(
         buffer,
         pagesize=A4,
         rightMargin=2 * cm,
@@ -680,165 +1407,600 @@ def generate_extraction_pdf(extraction: dict) -> bytes:
     )
 
     styles = getSampleStyleSheet()
-    story = []
 
-    title = Paragraph("IDP Invoice OCR - Extraction Report", styles["Title"])
-    story.append(title)
-    story.append(Spacer(1, 0.5 * cm))
-
-
-
-    ref = extraction.get("invoice_reference", {})
-    fin = extraction.get("financial", {})
-
-    data = [
-        ["Field", "Extracted value"],
-        ["Protocol number", ref.get("protocol_number", {}).get("value") or "Not detected"],
-        ["Invoice number", ref.get("invoice_number", {}).get("value") or "Not detected"],
-        ["Invoice date", ref.get("invoice_date", {}).get("value") or "Not detected"],
-        ["Net amount", fin.get("net_amount", {}).get("value") or "Not detected"],
+    story = [
+        Paragraph(
+            "IDP Invoice OCR - Extraction Report",
+            styles["Title"],
+        ),
+        Spacer(1, 0.7 * cm),
     ]
 
-    table = Table(data, colWidths=[6 * cm, 9 * cm])
+    reference = extraction.get(
+        "invoice_reference",
+        {},
+    )
+
+    financial = extraction.get(
+        "financial",
+        {},
+    )
+
+    rows = [
+        ["Field", "Extracted value"],
+
+        [
+            "Document family",
+            extraction.get(
+                "document_family",
+                "Not detected",
+            ),
+        ],
+
+        [
+            "Notary / Registrar name",
+            reference
+            .get("issuer_name", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "NIF / CIF",
+            reference
+            .get("nif_cif", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Protocol number",
+            reference
+            .get("protocol_number", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Invoice number",
+            reference
+            .get("invoice_number", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Invoice date",
+            reference
+            .get("invoice_date", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Base imponible",
+            financial
+            .get("base_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Base retencion",
+            financial
+            .get("retention_base_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "% IVA",
+            financial
+            .get("iva_percentage", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "% Retencion",
+            financial
+            .get("retention_percentage", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Importe IVA",
+            financial
+            .get("iva_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Importe Retencion",
+            financial
+            .get("retention_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Importe no sujeto",
+            financial
+            .get("non_taxable_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+
+        [
+            "Importe Neto",
+            financial
+            .get("net_amount", {})
+            .get("value")
+            or "Not detected",
+        ],
+    ]
+
+    table = Table(
+        rows,
+        colWidths=[
+            6.5 * cm,
+            8.5 * cm,
+        ],
+    )
+
     table.setStyle(
         TableStyle(
             [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-                ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (-1, 0),
+                    colors.lightgrey,
+                ),
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (-1, 0),
+                    "Helvetica-Bold",
+                ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.grey,
+                ),
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "MIDDLE",
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
             ]
         )
     )
 
     story.append(table)
 
-    doc.build(story)
+    document.build(story)
 
     pdf_bytes = buffer.getvalue()
     buffer.close()
 
     return pdf_bytes
 
+
 # =========================
-# lihne aana Streamlit app
+# Application Streamlit
 # =========================
-st.set_page_config(page_title="IDP MVP - OCR Blocks", layout="wide")
-st.title("IDP MVP — OCR structuré + visualisation")
-st.caption("Lecture de facture · Blocs OCR · Extraction 4 champs MVP · Multi-stratégie")
+st.set_page_config(
+    page_title="IDP Invoice Extraction - Robust V2",
+    layout="wide",
+)
+
+st.title(
+    "IDP — Extraction robuste de factures · ROBUST V2"
+)
+
+st.success(
+    "Moteur ROBUST V2 actif : "
+    "texte PDF natif + OCR fallback + "
+    "détection notaire / registre"
+)
+
+st.caption(
+    "Lecture PDF native d'abord · "
+    "OCR fallback · "
+    "validation financière métier"
+)
 
 with st.sidebar:
     st.header("Paramètres")
-    apply_preprocessing = st.checkbox("Prétraitement OCR", value=True)
-    min_conf_display = st.slider("Confiance minimale affichée", 0.0, 1.0, 0.2, 0.05)
-    show_debug = st.checkbox("Afficher debug ancres", value=False)
-    show_raw = st.checkbox("Afficher blocs bruts (non fusionnés)", value=False)
+
+    apply_preprocessing = st.checkbox(
+        "Prétraitement OCR",
+        value=True,
+    )
+
+    minimum_confidence = st.slider(
+        "Confiance minimale des blocs affichés",
+        0.0,
+        1.0,
+        0.20,
+        0.05,
+    )
+
+    show_raw_blocks = st.checkbox(
+        "Afficher les blocs OCR bruts",
+        value=False,
+    )
+
 
 uploaded_file = st.file_uploader(
     "Charge une facture (PDF, PNG, JPG, JPEG)",
-    type=["pdf", "png", "jpg", "jpeg"],
+    type=[
+        "pdf",
+        "png",
+        "jpg",
+        "jpeg",
+    ],
 )
 
 if uploaded_file is None:
-    st.info("Commence par charger une facture pour lancer le MVP.")
+    st.info(
+        "Charge un document pour lancer l'extraction."
+    )
     st.stop()
+
+
+# Le fichier est lu une seule fois.
+file_bytes = uploaded_file.getvalue()
+
 
 try:
-    pages = load_pages_from_upload(uploaded_file)
-except Exception as e:
-    st.error(f"Erreur au chargement du document : {e}")
+    pages = load_pages_from_bytes(
+        file_bytes,
+        uploaded_file.name,
+    )
+
+except Exception as error:
+    st.error(
+        f"Erreur de chargement : {error}"
+    )
     st.stop()
 
-page_index = st.selectbox(
-    "Page",
-    options=list(range(len(pages))),
-    format_func=lambda x: f"Page {x + 1}",
+
+# =========================
+# Sélection de la source texte
+# =========================
+embedded_text = ""
+
+if uploaded_file.name.lower().endswith(".pdf"):
+    embedded_text = extract_embedded_pdf_text(
+        file_bytes
+    )
+
+
+if len(embedded_text.strip()) >= 100:
+    document_text = embedded_text
+    text_source = "embedded_pdf_text"
+
+else:
+    document_text = ocr_pages_to_text(
+        pages,
+        apply_preprocessing=apply_preprocessing,
+    )
+
+    text_source = "tesseract_ocr_fallback"
+
+
+if not document_text.strip():
+    st.error(
+        "Aucun texte n'a pu être extrait du document."
+    )
+    st.stop()
+
+
+# Extraction sur le document complet.
+extraction, financial_warnings = extract_document(
+    document_text,
+    text_source,
 )
-original = pages[page_index]
-processed = preprocess_image(original) if apply_preprocessing else original
 
+
+# =========================
+# Page affichée
+# =========================
+page_index = st.selectbox(
+    "Page affichée",
+    options=list(range(len(pages))),
+    format_func=lambda index: (
+        f"Page {index + 1}"
+    ),
+)
+
+original_page = pages[page_index]
+
+ocr_page = (
+    preprocess_image(original_page)
+    if apply_preprocessing
+    else original_page
+)
+
+
+# Les blocs servent à la visualisation,
+# pas à l'extraction des PDF numériques.
 try:
-    raw_blocks, merged_blocks = run_tesseract_ocr(processed)
-except Exception as e:
-    st.error(f"Erreur OCR : {e}")
-    st.stop()
+    raw_blocks = run_tesseract_ocr_raw(
+        ocr_page,
+        psm=11,
+    )
 
-# nvisualisiw b les blocs fusionnés
-vis = draw_boxes(original, merged_blocks, min_conf=min_conf_display)
-extraction = extract_mvp_fields(raw_blocks, merged_blocks)
+    merged_blocks = merge_nearby_words(
+        raw_blocks
+    )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Visualisation", "Blocs OCR", "Extraction MVP", "Debug", "Bruts vs Fusionnés"])
+except Exception as error:
+    raw_blocks = []
+    merged_blocks = []
 
-with tab1:
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Document")
-        st.image(original, use_container_width=True)
-    with col2:
-        st.subheader("Blocs détectés")
-        st.image(vis, use_container_width=True)
+    st.warning(
+        "La visualisation OCR n'est pas disponible, "
+        "mais l'extraction peut continuer : "
+        f"{error}"
+    )
 
-with tab2:
-    display_blocks = raw_blocks if show_raw else merged_blocks
-    rows = [asdict(b) for b in display_blocks if b.confidence >= min_conf_display]
-    df = pd.DataFrame(rows)
-    st.caption(f"Mode : {'blocs bruts' if show_raw else 'blocs fusionnés'} — {len(rows)} blocs")
-    st.dataframe(df, use_container_width=True)
 
-with tab3:
+visualized_page = draw_boxes(
+    original_page,
+    merged_blocks,
+    minimum_confidence,
+)
+
+
+# =========================
+# Onglets
+# =========================
+tabs = st.tabs(
+    [
+        "Résultats",
+        "Visualisation",
+        "Texte document",
+        "Blocs OCR",
+        "Export",
+    ]
+)
+
+
+with tabs[0]:
+    col_a, col_b, col_c = st.columns(3)
+
+    col_a.metric(
+        "Famille",
+        extraction.get(
+            "document_family",
+            "unknown",
+        ),
+    )
+
+    col_b.metric(
+        "Source du texte",
+        extraction.get(
+            "text_source",
+            "unknown",
+        ),
+    )
+
+    col_c.metric(
+        "Confiance globale",
+        extraction.get(
+            "global_confidence",
+            0.0,
+        ),
+    )
+
     st.json(extraction)
+
     st.subheader("Lecture rapide")
-    ref = extraction["invoice_reference"]
-    fin = extraction["financial"]
-    st.write(f"**Nº Protocole** : {ref['protocol_number']['value']}  (conf: {ref['protocol_number']['confidence']})")
-    st.write(f"**Nº Facture**   : {ref['invoice_number']['value']}   (conf: {ref['invoice_number']['confidence']})")
-    st.write(f"**Date Facture** : {ref['invoice_date']['value']}     (conf: {ref['invoice_date']['confidence']})")
-    st.write(f"**Montant Net**  : {fin['net_amount']['value']}        (conf: {fin['net_amount']['confidence']})")
-    st.markdown("---")
-    st.write(f"Score bloc références : **{ref['block_confidence']}**")
-    st.write(f"Score bloc financier  : **{fin['block_confidence']}**")
-    st.write(f"Score global          : **{extraction['global_confidence']}**")
 
-    # =========================
-    # lihne zidit PDF export button
-    # =========================
-    st.markdown("---")
-    st.subheader("Export PDF")
+    reference = extraction[
+        "invoice_reference"
+    ]
 
-    pdf_report = generate_extraction_pdf(extraction)
+    financial = extraction[
+        "financial"
+    ]
+
+    readable_rows = [
+        (
+            "Nom notaire / registrateur",
+            "issuer_name",
+            reference,
+        ),
+        (
+            "NIF / CIF",
+            "nif_cif",
+            reference,
+        ),
+        (
+            "Nº protocole",
+            "protocol_number",
+            reference,
+        ),
+        (
+            "Nº facture",
+            "invoice_number",
+            reference,
+        ),
+        (
+            "Date facture",
+            "invoice_date",
+            reference,
+        ),
+        (
+            "Base imponible",
+            "base_amount",
+            financial,
+        ),
+        (
+            "Base retención",
+            "retention_base_amount",
+            financial,
+        ),
+        (
+            "% IVA",
+            "iva_percentage",
+            financial,
+        ),
+        (
+            "% Retención",
+            "retention_percentage",
+            financial,
+        ),
+        (
+            "Importe IVA",
+            "iva_amount",
+            financial,
+        ),
+        (
+            "Importe Retención",
+            "retention_amount",
+            financial,
+        ),
+        (
+            "Importe no sujeto",
+            "non_taxable_amount",
+            financial,
+        ),
+        (
+            "Importe Neto",
+            "net_amount",
+            financial,
+        ),
+    ]
+
+    table_data = []
+
+    for label, key, section in readable_rows:
+        result = section.get(
+            key,
+            {},
+        )
+
+        table_data.append(
+            {
+                "Champ": label,
+                "Valeur": result.get("value"),
+                "Confiance": result.get(
+                    "confidence"
+                ),
+                "Source": result.get("source"),
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(table_data),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader(
+        "Contrôle de cohérence financière"
+    )
+
+    if financial_warnings:
+        for warning in financial_warnings:
+            st.warning(warning)
+
+    else:
+        st.success(
+            "IVA, rétention et montant net "
+            "sont cohérents avec les règles métier."
+        )
+
+
+with tabs[1]:
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("Document")
+
+        st.image(
+            original_page,
+            use_container_width=True,
+        )
+
+    with right:
+        st.subheader("Blocs OCR")
+
+        st.image(
+            visualized_page,
+            use_container_width=True,
+        )
+
+
+with tabs[2]:
+    st.caption(
+        "Le moteur traite toutes les pages "
+        "du document."
+    )
+
+    st.text_area(
+        "Texte utilisé par le moteur",
+        value=document_text,
+        height=650,
+    )
+
+
+with tabs[3]:
+    blocks_to_show = (
+        raw_blocks
+        if show_raw_blocks
+        else merged_blocks
+    )
+
+    block_rows = [
+        asdict(block)
+        for block in blocks_to_show
+        if (
+            block.confidence
+            >= minimum_confidence
+        )
+    ]
+
+    st.caption(
+        f"{'Blocs bruts' if show_raw_blocks else 'Blocs fusionnés'} "
+        f"— {len(block_rows)} blocs"
+    )
+
+    st.dataframe(
+        pd.DataFrame(block_rows),
+        use_container_width=True,
+    )
+
+
+with tabs[4]:
+    pdf_report = generate_extraction_pdf(
+        extraction
+    )
 
     st.download_button(
-        label="Download extraction PDF report",
+        label="Télécharger le rapport PDF",
         data=pdf_report,
         file_name="invoice_extraction_report.pdf",
         mime="application/pdf",
     )
-
-    if extraction["global_confidence"] < 0.5:
-        st.warning(
-            " Confiance globale faible (< 0.5). "
-        )
-
-with tab4:
-    if show_debug:
-        debug_show_all_blocks(raw_blocks, merged_blocks)
-    else:
-        st.info("Coche 'Afficher debug ancres' dans la barre latérale pour voir le diagnostic.")
-
-with tab5:
-    st.subheader("Comparaison : bruts vs fusionnés")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write(f"**Blocs bruts** ({len(raw_blocks)} blocs)")
-        st.dataframe(pd.DataFrame([asdict(b) for b in raw_blocks]), use_container_width=True)
-    with c2:
-        st.write(f"**Blocs fusionnés** ({len(merged_blocks)} blocs)")
-        st.dataframe(pd.DataFrame([asdict(b) for b in merged_blocks]), use_container_width=True)
-
-st.markdown("---")
