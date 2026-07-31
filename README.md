@@ -1,36 +1,53 @@
 # IDP Invoice OCR MVP
 
-This project is a first MVP for Intelligent Document Processing of invoice documents.
+This project is a robust Intelligent Document Processing MVP for extracting structured information from Spanish notary and property registry invoices.
 
-## Features
+## Main features
 
 - PDF and image upload
-- OCR using Tesseract
-- PDF conversion using Poppler
+- Native PDF text extraction using PyMuPDF
+- Tesseract OCR fallback for scanned documents
+- Automatic document family detection
+- Separate extraction logic for:
+  - Notary invoices
+  - Property registry invoices
+- Multi-page document processing
+- Financial consistency validation
 - OCR block visualization
-- Raw and merged OCR blocks
-- Multi-strategy field extraction
-- Confidence scoring
-- Debug mode
-- Clean PDF export report without confidence scores
+- PDF report export
 
 ## Extracted fields
 
+### Invoice reference
+
+- Notary or registrar name
+- NIF / CIF
 - Protocol number
 - Invoice number
 - Invoice date
-- Net amount
 
- ## PDF Export
+### Financial information
 
-The application can generate a clean PDF extraction report containing only the extracted business fields:
+- Taxable base
+- Retention base
+- IVA percentage
+- Retention or IRPF percentage
+- IVA amount
+- Retention amount
+- Non-taxable amount
+- Final net amount
 
-- Protocol number
-- Invoice number
-- Invoice date
-- Net amount
+## Business validation
 
-Confidence scores and debug information remain visible inside the Streamlit interface, but they are not included in the exported PDF report.
+The application verifies:
+
+```text
+IVA amount = Taxable base × IVA percentage
+
+Retention amount = Retention base × Retention percentage
+
+Net amount = Taxable base + IVA amount
+             + Non-taxable amount - Retention amount
 
 ## Run
 
