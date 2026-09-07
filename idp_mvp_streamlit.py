@@ -336,8 +336,13 @@ def extract_embedded_pdf_text(file_bytes: bytes) -> str:
             filetype="pdf",
         )
 
+        # sort=True ynadhem les blocs de texte par position
+        # verticale puis horizontale (ordre de lecture ).
+        # Menghir hetha, PyMuPDF yguid le texte f l'ordre du flux
+        # interne du PDF, qui peut mélanger deux encadrés côte à
+        # côte (FACTURA / Protocolo) selon le générateur du PDF.
         return "\n".join(
-            page.get_text("text")
+            page.get_text("text", sort=True)
             for page in document
         )
 
@@ -837,6 +842,285 @@ def extract_registry_fields(
         },
     }
 
+def extract_reference_numbers(
+    text: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Identifie le numéro de protocole et le numéro de facture par leur
+    FORME plutôt que par leur position relative à un label — car le
+    texte natif du PDF peut mélanger l'ordre visuel de deux encadrés
+    côte à côte (FACTURA / Protocolo) selon le générateur du PDF.
+    """
+    invoice_number = first_regex(
+        r"(\d{4,10}-[A-Za-z]{1,4})",
+        text,
+    )
+
+    invoice_prefix = None
+    if invoice_number:
+        prefix_match = re.match(
+            r"(\d{4,10})",
+            invoice_number,
+        )
+        if prefix_match:
+            invoice_prefix = prefix_match.group(1)
+
+    # Le protocole est cherché dans une fenêtre proche du mot
+    # "Protocolo" plutôt que n'importe où dans le texte — sinon un
+    # numéro NIF suivi d'une lettre (ex: "74913735K") est aspiré par
+    # erreur, puisque la lettre n'est pas un chiffre et passe le test
+    # de "nombre autonome" avant même d'atteindre le vrai protocole.
+    protocol_number = None
+
+    for protocol_label in re.finditer(r"Protocolo", text, re.IGNORECASE):
+        window = text[protocol_label.end():protocol_label.end() + 40]
+        candidate = first_regex(r"(?<!\d)(\d{5,10})(?!\d)", window)
+
+        if candidate and candidate != invoice_prefix:
+            protocol_number = candidate
+            break
+
+    if protocol_number is None:
+        # Repli : nombre autonome dans tout le texte, en excluant
+        # explicitement le NIF/CIF et les numéros de téléphone/fax,
+        # qui ont la même forme numérique qu'un protocole.
+        excluded_numbers = set()
+
+        for excluded_match in re.finditer(
+            r"(?:NIF|CIF|Tlf|Fax)\s*:?\s*([A-Za-z]?\d{7,9})",
+            text,
+            re.IGNORECASE,
+        ):
+            digits_only = re.sub(r"\D", "", excluded_match.group(1))
+            excluded_numbers.add(digits_only)
+
+        plain_numbers = [
+            n for n in re.findall(r"(?<!\d)(\d{5,10})(?!\d)", text)
+            if n != invoice_prefix and n not in excluded_numbers
+        ]
+
+        protocol_number = (
+            plain_numbers[0]
+            if plain_numbers
+            else invoice_prefix
+        )
+
+    return protocol_number, invoice_number
+
+
+def extract_latest_date(text: str, window: int = 300) -> Optional[str]:
+    """
+    nrecuperiw ekher date fi l'en-tête du document.
+    La facture est toujours émise le jour de la signature du
+    protocole ou après donc f cas d'ambiguïté d'ordre, la date
+    la plus tardive heya la Fecha Factura.
+    """
+    header = text[:window]
+    dates = re.findall(DATE_PATTERN, header)
+
+    if not dates:
+        return None
+
+    def sort_key(date_str: str):
+        day, month, year = re.split(r"/", date_str)
+        year = int(year)
+        year += 2000 if year < 100 else 0
+        return (year, int(month), int(day))
+
+    return max(dates, key=sort_key)
+
+
+def extract_issuer_name(text: str) -> Optional[str]:
+    """
+    Extrait le nom du notaire ligne par ligne.
+    Un nom répété dans l'en-tête et près de la signature
+    est prioritaire sur une ville comme FUENGIROLA MÁLAGA.
+    """
+    lines = clean_lines(text)
+
+    prepared_lines = []
+
+    for line in lines:
+        candidate = re.sub(
+            r"^(?:FACTURA|EL\s+NOTARIO|NOTARIO)"
+            r"\s*[:.\-]?\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        prepared_lines.append(candidate)
+
+    name_pattern = re.compile(
+        r"[A-ZÁÉÍÓÚÑÜ]{2,}"
+        r"(?:[-'’][A-ZÁÉÍÓÚÑÜ]{2,})?"
+        r"(?:\s+[A-ZÁÉÍÓÚÑÜ]{2,}"
+        r"(?:[-'’][A-ZÁÉÍÓÚÑÜ]{2,})?){1,5}"
+    )
+
+    forbidden_words = {
+        "factura", "notario", "notaria", "protocolo",
+        "nif", "cif", "tlf", "fax", "avda", "avenida",
+        "calle", "europa", "base", "total", "retencion",
+        "desglose", "suplidos",
+    }
+
+    notario_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if re.fullmatch(
+            r"(?:EL\s+)?NOTARIO\.?",
+            line,
+            re.IGNORECASE,
+        )
+    ]
+
+    candidates = []
+
+    for index, candidate in enumerate(prepared_lines):
+        if not name_pattern.fullmatch(candidate):
+            continue
+
+        normalized = normalize_text(candidate)
+        words = normalized.split()
+
+        if any(word in forbidden_words for word in words):
+            continue
+
+        occurrences = sum(
+            normalize_text(line) == normalized
+            for line in prepared_lines
+        )
+
+        distance_to_notario = min(
+            (
+                abs(index - notario_index)
+                for notario_index in notario_indexes
+            ),
+            default=99,
+        )
+
+        near_identifier = any(
+            re.search(
+                r"\b(?:NIF|CIF|Tlf|Fax)\b",
+                lines[position],
+                re.IGNORECASE,
+            )
+            for position in range(
+                max(0, index - 3),
+                min(len(lines), index + 4),
+            )
+        )
+
+        if (
+            occurrences < 2
+            and distance_to_notario > 4
+            and not near_identifier
+        ):
+            continue
+
+        score = (
+            occurrences * 100
+            + (40 if near_identifier else 0)
+            + max(0, 30 - distance_to_notario * 5)
+            + len(words)
+        )
+
+        candidates.append((score, candidate))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item[0])[1]
+
+def extract_suplidos_total(
+    text: str,
+    max_block_lines: int = 12,
+) -> Optional[str]:
+    """
+    Total des suplidos (débours) : correspond au montant non sujeto
+    quand la facture n'expose pas ce libellé explicitement.
+
+    Le libellé doit occuper toute une ligne ("Suplidos" ou
+    "Desglose Suplidos"), pour ne pas confondre avec l'en-tête
+    d'arancel "SUPLIDOS Y DERECHOS (REAL DECRETO ...)".
+
+    Formats gérés :
+      - libellé + montant sur la même ligne   -> montant direct
+      - bloc avec "Total" sans deux-points    -> ce total, non ressommé
+      - bloc multi-lignes sans total          -> somme des montants
+
+    Le bloc s'arrête au premier libellé de synthèse globale
+    (TOTAL:, BASE, RETENCION, IMPORTE, IVA, LIQUIDO, ARANCELES)
+    ou après max_block_lines lignes.
+    """
+    lines = clean_lines(text)
+
+    label_pattern = re.compile(
+        rf"^(?:Desglose\s+)?Suplidos\s*:?\s*({AMOUNT_PATTERN})?\s*€?$",
+        re.IGNORECASE,
+    )
+
+    # Testé AVANT block_total_pattern : "TOTAL:" (avec deux-points)
+    # est le total global de la facture, pas celui du bloc suplidos.
+    section_stop_pattern = re.compile(
+        r"^(?:TOTAL\s*:|BASE\b|RETENCI[ÓO]N|IMPORTE|IVA\b|L[ÍI]QUIDO|ARANCELES)",
+        re.IGNORECASE,
+    )
+
+    block_total_pattern = re.compile(
+        r"^Total\b(?!\s*:)",
+        re.IGNORECASE,
+    )
+
+    label_index = None
+
+    for index, line in enumerate(lines):
+        label_match = label_pattern.match(line)
+
+        if label_match:
+            if label_match.group(1):
+                return label_match.group(1)
+
+            label_index = index
+            break
+
+    if label_index is None:
+        return None
+
+    block_lines: List[str] = []
+    explicit_total_line: Optional[str] = None
+
+    for line in lines[label_index + 1 : label_index + 1 + max_block_lines]:
+        if section_stop_pattern.match(line):
+            break
+
+        if block_total_pattern.match(line):
+            explicit_total_line = line
+            break
+
+        block_lines.append(line)
+
+    if explicit_total_line:
+        return first_regex(
+            rf"({AMOUNT_PATTERN})",
+            explicit_total_line,
+        )
+
+    amounts = re.findall(
+        AMOUNT_PATTERN,
+        "\n".join(block_lines),
+    )
+
+    if not amounts:
+        return None
+
+    total = sum(
+        amount_to_float(amount) or 0.0
+        for amount in amounts
+    )
+
+    return format_european_amount(total)
 
 # =========================
 # Extraction facture notaire
@@ -847,12 +1131,16 @@ def extract_notary_fields(
     lines = clean_lines(document_text)
     text = "\n".join(lines)
 
-    # Le nom du notaire est généralement la première ligne.
-    issuer_name = (
-        lines[0]
-        if lines
-        else None
-    )
+    # Le nom du notaire est cherché près du mot NOTARIO plutôt que
+    # pris comme première ligne — voir extract_issuer_name.
+    issuer_name = extract_issuer_name(text)
+
+    if issuer_name is None:
+        issuer_name = (
+            lines[0]
+            if lines
+            else None
+        )
 
     nif_cif = first_regex(
         r"(?:"
@@ -867,25 +1155,7 @@ def extract_notary_fields(
     if nif_cif:
         nif_cif = nif_cif.upper()
 
-    protocol_number = first_regex(
-        r"N[ºo°]\s*Protocolo"
-        r"\s*:\s*([^\n]+)",
-        text,
-    )
-
-    if protocol_number is None:
-        protocol_number = first_regex(
-            r"(?m)^Protocolo"
-            r"\s*\n?\s*"
-            r"(\d{3,10})",
-            text,
-        )
-
-    invoice_number = first_regex(
-        r"N[ºo°]\s*Factura"
-        r"\s*:\s*([^\n]+)",
-        text,
-    )
+    protocol_number, invoice_number = extract_reference_numbers(text)
 
     if invoice_number is None:
         invoice_number = first_regex(
@@ -902,10 +1172,10 @@ def extract_notary_fields(
         text,
     )
 
-    if (
-        invoice_date is None
-        and invoice_number is not None
-    ):
+    if invoice_date is None:
+        invoice_date = extract_latest_date(text)
+
+
         invoice_date = first_regex(
             rf"{re.escape(invoice_number)}"
             rf"\s+({DATE_PATTERN})",
@@ -954,39 +1224,23 @@ def extract_notary_fields(
         # Fallback pour les factures du type :
         # BASE 820,51
         # IVA[21%](B.Imponible: 820,51) 172,31
-        base_amount = last_regex(
-            rf"(?m)^BASE"
-            rf"(?:\s+IMPONIBLE)?"
-            rf"\s*[:\-]?\s*"
-            rf"({AMOUNT_PATTERN})",
-            text,
-        )
 
         iva_line_match = re.search(
-            rf"IVA"
-            rf"\s*[\[(]?\s*"
-            rf"({PERCENT_PATTERN})"
-            rf"\s*%"
-            rf"[^\n]*?"
-            rf"({AMOUNT_PATTERN})"
-            rf"\s*€?\s*$",
+            rf"IVA\s*[\[(]?\s*({PERCENT_PATTERN})\s*%\s*[\])]?"
+            rf"\s*\(?\s*B\.?\s*Imponible\s*:?\s*({AMOUNT_PATTERN})\s*\)?"
+            rf"[^\n]*?({AMOUNT_PATTERN})\s*€?\s*$",
             text,
             re.IGNORECASE | re.MULTILINE,
         )
 
-        iva_percentage = (
-            normalize_percentage(
-                iva_line_match.group(1)
-            )
-            if iva_line_match
-            else None
-        )
-
-        iva_amount = (
-            iva_line_match.group(2)
-            if iva_line_match
-            else None
-        )
+        if iva_line_match:
+            iva_percentage = normalize_percentage(iva_line_match.group(1))
+            base_amount = iva_line_match.group(2)
+            iva_amount = iva_line_match.group(3)
+        else:
+            iva_percentage = None
+            base_amount = None
+            iva_amount = None
 
         non_taxable_amount = first_regex(
             rf"(?:"
@@ -997,6 +1251,9 @@ def extract_notary_fields(
             rf"({AMOUNT_PATTERN})",
             text,
         )
+
+        if non_taxable_amount is None:
+            non_taxable_amount = extract_suplidos_total(text)
 
         if non_taxable_amount is None:
             non_taxable_amount = "0,00"
