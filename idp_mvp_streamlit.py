@@ -874,9 +874,15 @@ def extract_reference_numbers(
 
     for protocol_label in re.finditer(r"Protocolo", text, re.IGNORECASE):
         window = text[protocol_label.end():protocol_label.end() + 40]
-        candidate = first_regex(r"(?<!\d)(\d{5,10})(?!\d)", window)
+        # Capture optionnelle du suffixe année (/22, /2022)
+        candidate = first_regex(
+            r"(?<!\d)(\d{3,10}(?:/\d{2,4})?)(?!\d)",
+            window,
+        )
 
-        if candidate and candidate != invoice_prefix:
+        candidate_digits = re.sub(r"\D", "", candidate) if candidate else None
+
+        if candidate_digits and candidate_digits != invoice_prefix:
             protocol_number = candidate
             break
 
@@ -887,9 +893,9 @@ def extract_reference_numbers(
         excluded_numbers = set()
 
         for excluded_match in re.finditer(
-            r"(?:NIF|CIF|Tlf|Fax)\s*:?\s*([A-Za-z]?\d{7,9})",
-            text,
-            re.IGNORECASE,
+                r"(?:N\.?I\.?F\.?|C\.?I\.?F\.?|Tlf|Fax)\s*:?\s*([A-Za-z]?\d{7,9})",
+                text,
+                re.IGNORECASE,
         ):
             digits_only = re.sub(r"\D", "", excluded_match.group(1))
             excluded_numbers.add(digits_only)
@@ -930,108 +936,97 @@ def extract_latest_date(text: str, window: int = 300) -> Optional[str]:
     return max(dates, key=sort_key)
 
 
-def extract_issuer_name(text: str) -> Optional[str]:
+def extract_issuer_name(text: str, nif_cif: Optional[str]) -> Optional[str]:
     """
-    Extrait le nom du notaire ligne par ligne.
-    Un nom répété dans l'en-tête et près de la signature
-    est prioritaire sur une ville comme FUENGIROLA MÁLAGA.
+    Cherche le nom du notaire à proximité de son NIF/CIF déjà extrait,
+    plutôt que par la distance au mot NOTARIO — car ce mot peut
+    n'apparaître que dans le paragraphe légal de bas de page
+    ("...ante el propio Notario...") sur certains gabarits, ce qui
+    fausse la distance dans l'ordre du texte natif du PDF et fait
+    remonter le nom du client à la place de celui du notaire.
+
+    Le nom de l'émetteur se trouve toujours dans le même bloc
+    d'en-tête que son NIF/CIF (nom, adresse, téléphone, puis
+    NIF/CIF) — chercher un nom candidat à proximité de la valeur
+    EXACTE du NIF/CIF est un ancrage fiable, quel que soit le gabarit.
     """
     lines = clean_lines(text)
 
-    prepared_lines = []
-
-    for line in lines:
-        candidate = re.sub(
-            r"^(?:FACTURA|EL\s+NOTARIO|NOTARIO)"
-            r"\s*[:.\-]?\s*",
-            "",
-            line,
-            flags=re.IGNORECASE,
-        ).strip()
-
-        prepared_lines.append(candidate)
-
     name_pattern = re.compile(
         r"[A-ZÁÉÍÓÚÑÜ]{2,}"
-        r"(?:[-'’][A-ZÁÉÍÓÚÑÜ]{2,})?"
+        r"(?:[-''][A-ZÁÉÍÓÚÑÜ]{2,})?"
         r"(?:\s+[A-ZÁÉÍÓÚÑÜ]{2,}"
-        r"(?:[-'’][A-ZÁÉÍÓÚÑÜ]{2,})?){1,5}"
+        r"(?:[-''][A-ZÁÉÍÓÚÑÜ]{2,})?){1,4}"
     )
 
     forbidden_words = {
         "factura", "notario", "notaria", "protocolo",
         "nif", "cif", "tlf", "fax", "avda", "avenida",
         "calle", "europa", "base", "total", "retencion",
-        "desglose", "suplidos",
+        "desglose", "suplidos", "espana", "nihil", "prius",
+        "fide", "los", "interesados", "podran", "impugnar",
+        "esta", "minuta", "ante", "autorizante", "plazo",
+        "quince", "dias", "habiles", "siguientes",
+        "notificacion", "entrega", "directamente", "junta",
+        "directiva", "colegio", "notarial", "correspondiente",
+        "conformidad", "previsto", "reglamento", "general",
+        "proteccion", "datos", "informamos", "objeto",
+        "tratamiento","cl",
     }
 
-    notario_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if re.fullmatch(
-            r"(?:EL\s+)?NOTARIO\.?",
-            line,
-            re.IGNORECASE,
-        )
-    ]
+    postal_code_before = re.compile(r"\d{4,5}\s*$")
 
-    candidates = []
+    def collect_candidates(candidate_lines: List[str]) -> List[str]:
+        found = []
 
-    for index, candidate in enumerate(prepared_lines):
-        if not name_pattern.fullmatch(candidate):
-            continue
+        for line in candidate_lines:
+            for match in name_pattern.finditer(line):
+                candidate = match.group(0).strip()
+                words = normalize_text(candidate).split()
 
+                if any(word in forbidden_words for word in words):
+                    continue
+
+                if not (2 <= len(words) <= 5):
+                    continue
+
+                # Exclut les lignes d'adresse du type "07001 PALMA DE
+                # MALLORCA", où un code postal précède directement le
+                # nom de la ville.
+                prefix = line[: match.start()]
+                if postal_code_before.search(prefix):
+                    continue
+
+                found.append(candidate)
+
+        return found
+
+    # Ancrage principal : nom trouvé dans le même bloc d'en-tête que
+    # le NIF/CIF déjà extrait (fiable, car unique dans le document).
+    if nif_cif:
+        for index, line in enumerate(lines):
+            if nif_cif in line.upper():
+                window = lines[max(0, index - 6): index + 1]
+                candidates = collect_candidates(window)
+
+                if candidates:
+                    return candidates[0]
+
+    # Repli : nom le plus fréquent dans tout le document — utile si
+    # le NIF/CIF n'a pas été trouvé ou n'est pas assez proche du nom.
+    frequency: Dict[str, Tuple[str, int]] = {}
+
+    for candidate in collect_candidates(lines):
         normalized = normalize_text(candidate)
-        words = normalized.split()
+        display, count = frequency.get(normalized, (candidate, 0))
+        frequency[normalized] = (display, count + 1)
 
-        if any(word in forbidden_words for word in words):
-            continue
-
-        occurrences = sum(
-            normalize_text(line) == normalized
-            for line in prepared_lines
-        )
-
-        distance_to_notario = min(
-            (
-                abs(index - notario_index)
-                for notario_index in notario_indexes
-            ),
-            default=99,
-        )
-
-        near_identifier = any(
-            re.search(
-                r"\b(?:NIF|CIF|Tlf|Fax)\b",
-                lines[position],
-                re.IGNORECASE,
-            )
-            for position in range(
-                max(0, index - 3),
-                min(len(lines), index + 4),
-            )
-        )
-
-        if (
-            occurrences < 2
-            and distance_to_notario > 4
-            and not near_identifier
-        ):
-            continue
-
-        score = (
-            occurrences * 100
-            + (40 if near_identifier else 0)
-            + max(0, 30 - distance_to_notario * 5)
-            + len(words)
-        )
-
-        candidates.append((score, candidate))
-
-    if not candidates:
+    if not frequency:
         return None
 
-    return max(candidates, key=lambda item: item[0])[1]
+    best_display, _ = max(frequency.values(), key=lambda item: item[1])
+
+    return best_display
 
 def extract_suplidos_total(
     text: str,
@@ -1122,6 +1117,178 @@ def extract_suplidos_total(
 
     return format_european_amount(total)
 
+def extract_financial_summary_table(text: str) -> Dict[str, str]:
+    """
+    Gère le format où toute une ligne de synthèse regroupe base/IVA
+    (et parfois la base exonérée) sur une seule ligne physique, ex :
+    "37,04 € 755,09 € IVA (21,00%) 158,57 €" puis
+    "755,09 € RETENCION (0,00%) -0,00 €" — ni summary_match (3 lignes
+    séparées) ni iva_line_match (format "B.Imponible" explicite) ne
+    couvrent ce cas.
+    """
+    result: Dict[str, str] = {}
+
+    iva_row = re.search(
+        rf"(?:({AMOUNT_PATTERN})\s*€?\s+)?"
+        rf"({AMOUNT_PATTERN})\s*€?\s*"
+        rf"IVA\s*\(?\s*({PERCENT_PATTERN})\s*%\s*\)?\s*"
+        rf"({AMOUNT_PATTERN})\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+
+    if iva_row:
+        if iva_row.group(1):
+            result["non_taxable_amount"] = iva_row.group(1)
+        result["base_amount"] = iva_row.group(2)
+        result["iva_percentage"] = normalize_percentage(iva_row.group(3))
+        result["iva_amount"] = iva_row.group(4)
+
+    retention_row = re.search(
+        rf"({AMOUNT_PATTERN})\s*€?\s*"
+        rf"RETENCI[ÓO]N\s*\(?\s*({PERCENT_PATTERN})\s*%\s*\)?\s*"
+        rf"(-?{AMOUNT_PATTERN})\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+
+    if retention_row:
+        result["retention_base_amount"] = retention_row.group(1)
+        result["retention_percentage"] = normalize_percentage(retention_row.group(2))
+
+        retention_float = amount_to_float(retention_row.group(3))
+        result["retention_amount"] = format_european_amount(
+            abs(retention_float) if retention_float is not None else None
+        )
+
+    return result
+
+
+# =========================
+# Extraction ligne par ligne (fallback robuste)
+# =========================
+def extract_line_based_financials(text: str) -> Dict[str, str]:
+    """
+    Fallback pour le format "Totales" très courant dans les factures
+    notariales espagnoles, où chaque ligne contient un libellé suivi
+    d'un montant aligné à droite :
+
+        TOTAL DERECHOS          580,71 €
+        TOTAL SUPLIDOS           10,11 €
+        BASE IMPONIBLE IVA      580,71 €
+        IVA  (21,00%)           121,95 €
+        BASE IMPONIBLE RET.     580,71 €
+        RETENCIÓN (00,00%)       -0,00 €
+        TOTAL                   712,77 €
+
+    Ce format n'est couvert ni par summary_match (en-têtes multi-
+    lignes), ni par iva_line_match (B.Imponible inline), ni par
+    extract_financial_summary_table (tout sur une seule ligne).
+
+    La fonction retourne un Dict[str, str] avec les champs trouvés ;
+    elle ne remplit que ce qu'elle trouve et ne force jamais de
+    valeur par défaut — c'est l'appelant qui décide.
+    """
+    result: Dict[str, str] = {}
+
+    # --- Base Imponible ---
+    # "BASE IMPONIBLE IVA   580,71 €"  ou  "BASE IMPONIBLE   580,71"
+    # Exclut "BASE IMPONIBLE RET." pour ne pas confondre les deux.
+    base_match = re.search(
+        rf"BASE\s+IMPONIBLE"
+        rf"(?:\s+IVA)?"
+        rf"(?!\s*RET)"
+        rf"\s*:?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+    if base_match:
+        result["base_amount"] = base_match.group(1)
+
+    # --- IVA (pourcentage + montant) ---
+    # "IVA (21,00%)  121,95 €"  ou  "IVA: 21%  121,95"
+    # ou "IVA  (21,00%)  121,95 €" (espaces multiples avant la
+    # parenthèse, fréquent en OCR).
+    iva_match = re.search(
+        rf"IVA\s*"
+        rf"[:\(]?\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*"
+        rf"\)?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+    if iva_match:
+        result["iva_percentage"] = normalize_percentage(iva_match.group(1))
+        result["iva_amount"] = iva_match.group(2)
+
+    # --- Base Imponible Retención ---
+    # "BASE IMPONIBLE RET.  580,71 €"  ou  "BASE IMPONIBLE RET  580,71"
+    ret_base_match = re.search(
+        rf"BASE\s+IMPONIBLE\s+RET\.?"
+        rf"\s*:?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+    if ret_base_match:
+        result["retention_base_amount"] = ret_base_match.group(1)
+
+    # --- Retención (pourcentage + montant) ---
+    # "RETENCIÓN (00,00%)  -0,00 €"  ou  "RETENCION: 15%  -123,08"
+    ret_match = re.search(
+        rf"RETENCI[ÓO]N\s*"
+        rf"[:\(]?\s*"
+        rf"({PERCENT_PATTERN})"
+        rf"\s*%\s*"
+        rf"\)?\s*"
+        rf"(-?{AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+    if ret_match:
+        result["retention_percentage"] = normalize_percentage(ret_match.group(1))
+
+        retention_float = amount_to_float(ret_match.group(2))
+        result["retention_amount"] = format_european_amount(
+            abs(retention_float) if retention_float is not None else None
+        )
+
+    # --- Suplidos (non soumis) ---
+    # "TOTAL SUPLIDOS  10,11 €"
+    suplidos_match = re.search(
+        rf"TOTAL\s+SUPLIDOS"
+        rf"\s*:?\s*"
+        rf"({AMOUNT_PATTERN})"
+        rf"\s*€?",
+        text,
+        re.IGNORECASE,
+    )
+    if suplidos_match:
+        result["non_taxable_amount"] = suplidos_match.group(1)
+
+    # --- Net / Total (le DERNIER "TOTAL" autonome) ---
+    # "TOTAL  712,77 €" — doit être le total final, pas
+    # "TOTAL DERECHOS" ou "TOTAL SUPLIDOS".
+    # On utilise last_regex pour prendre le dernier match,
+    # qui correspond au grand total en bas du bloc Totales.
+    net_match = last_regex(
+        rf"(?m)^TOTAL\s+({AMOUNT_PATTERN})\s*€?\s*$",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if net_match:
+        result["net_amount"] = net_match
+
+    return result
+
+
 # =========================
 # Extraction facture notaire
 # =========================
@@ -1131,17 +1298,7 @@ def extract_notary_fields(
     lines = clean_lines(document_text)
     text = "\n".join(lines)
 
-    # Le nom du notaire est cherché près du mot NOTARIO plutôt que
-    # pris comme première ligne — voir extract_issuer_name.
-    issuer_name = extract_issuer_name(text)
-
-    if issuer_name is None:
-        issuer_name = (
-            lines[0]
-            if lines
-            else None
-        )
-
+    # --- NIF/CIF : pattern principal ---
     nif_cif = first_regex(
         r"(?:"
         r"C\.?\s*I\.?\s*F\.?"
@@ -1152,10 +1309,55 @@ def extract_notary_fields(
         text,
     )
 
+    # --- NIF/CIF : fallback OCR-résilient ---
+    # Tesseract peut lire "I" comme "l", "|", "1", ou "i".
+    if nif_cif is None:
+        nif_cif = first_regex(
+            r"[CNcn][\.\s]*[IiLl|1][\.\s]*[Ff][\.\s]*[:.]?\s*"
+            r"([A-Z]?\d{7,8}[A-Z0-9]?)",
+            text,
+            flags=re.DOTALL,
+        )
+
     if nif_cif:
         nif_cif = nif_cif.upper()
 
-    protocol_number, invoice_number = extract_reference_numbers(text)
+    # Le nom du notaire est cherché près de son NIF/CIF plutôt que
+    # pris comme première ligne — voir extract_issuer_name.
+    issuer_name = extract_issuer_name(text, nif_cif)
+
+    if issuer_name is None:
+        issuer_name = (
+            lines[0]
+            if lines
+            else None
+        )
+
+    # --- Protocole : pattern direct avec suffixe année ---
+    # "N° Protocolo: 002440/22" ou "Nº Protocolo: 1234"
+    protocol_number = first_regex(
+        r"N[ºo°]\s*Protocolo"
+        r"\s*:?\s*"
+        r"(\d{3,10}(?:\s*/\s*\d{2,4})?)",
+        text,
+    )
+
+    if protocol_number:
+        # Normalise les espaces autour du slash.
+        protocol_number = re.sub(r"\s*/\s*", "/", protocol_number).strip()
+
+    # Repli : extraction par forme (extract_reference_numbers)
+    if protocol_number is None:
+        protocol_number, invoice_number_from_refs = extract_reference_numbers(text)
+    else:
+        _, invoice_number_from_refs = extract_reference_numbers(text)
+
+    # --- Numéro de facture ---
+    invoice_number = first_regex(
+        r"N[ºo°]\s*Factura"
+        r"\s*:?\s*([^\n]+)",
+        text,
+    )
 
     if invoice_number is None:
         invoice_number = first_regex(
@@ -1165,6 +1367,21 @@ def extract_notary_fields(
             text,
         )
 
+    # Format "Nº Factura: B 1474" (lettre-espace-chiffres, sans
+    # tiret) — rencontré sur certains gabarits notariaux.
+    if invoice_number is None:
+        invoice_number = first_regex(
+            r"N[ºo°]\s*Factura\s*:\s*([A-Za-z]?\s?\d{1,10})",
+            text,
+        )
+
+        if invoice_number:
+            invoice_number = re.sub(r"\s+", " ", invoice_number).strip()
+
+    # Dernier recours : le numéro trouvé par extract_reference_numbers.
+    if invoice_number is None:
+        invoice_number = invoice_number_from_refs
+
     invoice_date = first_regex(
         rf"Fecha\s+Factura"
         rf"\s*:\s*"
@@ -1172,21 +1389,22 @@ def extract_notary_fields(
         text,
     )
 
+    # Fallback : "Fecha: DD/MM/YYYY" (sans le mot "Factura")
+    if invoice_date is None:
+        invoice_date = first_regex(
+            rf"Fecha\s*:\s*({DATE_PATTERN})",
+            text,
+        )
+
     if invoice_date is None:
         invoice_date = extract_latest_date(text)
 
 
-        invoice_date = first_regex(
-            rf"{re.escape(invoice_number)}"
-            rf"\s+({DATE_PATTERN})",
-            re.sub(
-                r"\s+",
-                " ",
-                text,
-            ),
-        )
+    # ==========================================================
+    # Extraction financière — cascade de 4 extracteurs
+    # ==========================================================
 
-    # Layout notarial avec les titres puis les valeurs en dessous.
+    # --- Extracteur 1 : Layout multi-lignes (en-têtes puis valeurs) ---
     summary_match = re.search(
         rf"Base Exenta IVA"
         rf"\s*\n"
@@ -1221,8 +1439,7 @@ def extract_notary_fields(
         iva_amount = summary_match.group(4)
 
     else:
-        # Fallback pour les factures du type :
-        # BASE 820,51
+        # --- Extracteur 2 : IVA inline avec B.Imponible ---
         # IVA[21%](B.Imponible: 820,51) 172,31
 
         iva_line_match = re.search(
@@ -1255,9 +1472,42 @@ def extract_notary_fields(
         if non_taxable_amount is None:
             non_taxable_amount = extract_suplidos_total(text)
 
+        # --- Extracteur 3 : Ligne condensée (tout sur une ligne) ---
+        table_row = extract_financial_summary_table(text)
+
+        if base_amount is None:
+            base_amount = table_row.get("base_amount")
+        if iva_percentage is None:
+            iva_percentage = table_row.get("iva_percentage")
+        if iva_amount is None:
+            iva_amount = table_row.get("iva_amount")
+        if non_taxable_amount is None:
+            non_taxable_amount = table_row.get("non_taxable_amount")
+
+        # --- Extracteur 4 (NOUVEAU) : Ligne par ligne (Totales box) ---
+        # Fallback final pour le format très courant :
+        #   BASE IMPONIBLE IVA    580,71 €
+        #   IVA (21,00%)          121,95 €
+        #   TOTAL                 712,77 €
+        line_based = extract_line_based_financials(text)
+
+        if base_amount is None:
+            base_amount = line_based.get("base_amount")
+        if iva_percentage is None:
+            iva_percentage = line_based.get("iva_percentage")
+        if iva_amount is None:
+            iva_amount = line_based.get("iva_amount")
+        if non_taxable_amount is None:
+            non_taxable_amount = line_based.get("non_taxable_amount")
+
         if non_taxable_amount is None:
             non_taxable_amount = "0,00"
 
+    # ==========================================================
+    # Extraction rétention — cascade de 3 extracteurs
+    # ==========================================================
+
+    # --- Extracteur rétention 1 : Multi-lignes (base\nRETENCION\nmontant) ---
     retention_match = re.search(
         rf"({AMOUNT_PATTERN})"
         rf"\s*€?"
@@ -1291,7 +1541,7 @@ def extract_notary_fields(
         )
 
     else:
-        # Fallback pour :
+        # --- Extracteur rétention 2 : Inline ---
         # RETENCION:15% (B.Imponible 820,51) -123,08
         retention_inline = re.search(
             rf"RETENCI[ÓO]N"
@@ -1327,9 +1577,26 @@ def extract_notary_fields(
             )
 
         else:
-            retention_base_amount = base_amount
-            retention_percentage = "0,00"
-            retention_amount = "0,00"
+            # --- Extracteur rétention 3 (NOUVEAU) : Ligne par ligne ---
+            # Utilise les résultats de extract_line_based_financials
+            # déjà calculé plus haut.
+            line_based_ret = extract_line_based_financials(text)
+            lb_ret_pct = line_based_ret.get("retention_percentage")
+            lb_ret_amt = line_based_ret.get("retention_amount")
+            lb_ret_base = line_based_ret.get("retention_base_amount")
+
+            if lb_ret_pct is not None and lb_ret_amt is not None:
+                retention_percentage = lb_ret_pct
+                retention_amount = lb_ret_amt
+                retention_base_amount = lb_ret_base or base_amount
+            else:
+                retention_base_amount = base_amount
+                retention_percentage = "0,00"
+                retention_amount = "0,00"
+
+    # ==========================================================
+    # Net amount — cascade de 3 extracteurs
+    # ==========================================================
 
     # Selon la définition métier du boss,
     # le net final correspond au montant à payer.
@@ -1349,6 +1616,15 @@ def extract_notary_fields(
             rf"({AMOUNT_PATTERN})"
             rf"\s*€?",
             text,
+        )
+
+    # --- Net fallback (NOUVEAU) : TOTAL autonome (dernier match) ---
+    # "TOTAL  712,77 €" — le grand total en fin de bloc Totales.
+    if net_amount is None:
+        net_amount = last_regex(
+            rf"(?m)^TOTAL\s+({AMOUNT_PATTERN})\s*€?\s*$",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
         )
 
     return {
